@@ -1,133 +1,137 @@
-name: Cleanup Old Workflow Runs and Merged Branches
+name: Central Cleanup — Workflow Runs and Merged Branches
+
+# One central workflow that cleans every repository listed in
+# config/repositories.txt using the dedicated repository secret CLEANUP_TOKEN.
+#
+# Safety model:
+#   * schedule        -> always DRY RUN (preview only, no deletions)
+#   * workflow_dispatch mode=dry-run -> preview (default)
+#   * workflow_dispatch mode=live    -> deletions, only with confirm_live=DELETE
+# The workflow token is read-only; all deletions use CLEANUP_TOKEN.
 
 on:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Dry run (no deletions, only report) — الإعداد الافتراضي الآن معاينة آمنة"
+      mode:
+        description: "dry-run = preview only (default). live = delete, requires confirm_live=DELETE."
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - live
+      repository:
+        description: "Repository from config/repositories.txt, or 'all'."
         required: false
-        default: true
-        type: boolean
-      cutoff_hours:
-        description: "Hours before deleting completed runs"
+        default: "all"
+        type: string
+      keep_latest:
+        description: "Completed workflow runs to keep per repository."
         required: false
-        default: "24"
+        default: "20"
+        type: string
+      confirm_live:
+        description: "Type DELETE to authorize live deletions."
+        required: false
+        default: ""
         type: string
 
-# Workflow defaults are read-only. Only the explicitly dispatched cleanup job
-# receives deletion capabilities.
+# The central repository's own token is read-only: it only checks out code.
 permissions:
-  actions: read
   contents: read
-  pull-requests: read
 
 concurrency:
-  group: cleanup-old-workflow-runs
+  group: central-cleanup
   cancel-in-progress: false
 
 jobs:
   cleanup:
-    name: Cleanup runs and branches
-    # Both scheduled and manual cleanup are confined to the repository default
-    # branch; PR and feature refs can never receive the deletion token.
+    name: Central cleanup
+    # Scheduled and manual cleanup are confined to the default branch, so a pull
+    # request or feature ref can never reach the cleanup token.
     if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-    permissions:
-      actions: write
-      contents: write
-      pull-requests: read
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CLEANUP_TOKEN: ${{ secrets.CLEANUP_TOKEN }}
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - name: Checkout with full history
+      - name: Checkout central repository
         uses: actions/checkout@v5
         with:
-          sparse-checkout: |
-            /*
-            !/Mostmskat/
-            !/local-data/
-          sparse-checkout-cone-mode: false
-          fetch-depth: 0
-          fetch-tags: true
+          # Never persist the workflow token into the git config.
+          persist-credentials: false
+          fetch-depth: 1
 
-      - name: Configure git for branch checks
+      - name: Verify the cleanup token is available
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin --prune --tags
-          git fetch origin "+refs/heads/*:refs/remotes/origin/*" || true
-          echo "Remote branches:"
-          git branch -r | head -n 50
-          echo "Default branch from git:"
-          git symbolic-ref refs/remotes/origin/HEAD || echo "no origin/HEAD"
+          if [[ -z "${CLEANUP_TOKEN:-}" ]]; then
+            echo "::error title=configuration::Repository secret CLEANUP_TOKEN is not available to this workflow. Nothing was deleted."
+            exit 1
+          fi
+          echo "CLEANUP_TOKEN is present (its value is never printed)."
 
-      - name: Show repository state
+      - name: Resolve run mode
+        id: mode
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_CONFIRM: ${{ inputs.confirm_live }}
         run: |
           set -euo pipefail
-          repo="${{ github.repository }}"
-          echo "Repository: $repo"
-          default=$(gh api "repos/$repo" --jq .default_branch)
-          echo "Default branch (API): $default"
-          echo "Open PRs:"
-          gh api "repos/$repo/pulls?state=open&per_page=100" --jq '.[].head.ref' || true
-          echo "Branches (first 20):"
-          gh api "repos/$repo/branches?per_page=100" --jq '.[].name' | head -n 20 || true
-
-      - name: Run branch and runs cleanup
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          # Fail closed; the guarded script below enables deletion only for an explicit manual dry_run=false dispatch.
-          DELETE_BRANCHES: 'false'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # SAFETY: scheduled runs are now preview-only until manual review completes (P0).
-          # Deletion only occurs when workflow_dispatch is run with dry_run=false explicitly.
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            export DELETE_BRANCHES="false"
-            cutoff="${{ inputs.cutoff_hours || '24' }}"
-            echo "::notice title=safety::Scheduled cleanup is in DRY-RUN preview mode — no branches/runs will be deleted. Run workflow_dispatch with dry_run=false for live deletion."
-          else
-            if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-              export DELETE_BRANCHES="false"
-              echo "Dry run requested via input — no deletions will occur."
-            else
-              export DELETE_BRANCHES="false"
-              # Allow live only when explicitly requested via dry_run=false on dispatch
-              if [[ "${{ inputs.dry_run }}" == "false" ]]; then
-                export DELETE_BRANCHES="true"
-                echo "::warning title=safety::LIVE deletion enabled via explicit dry_run=false — proceeding with verified deletions only."
-              fi
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            echo "mode=dry-run" >> "${GITHUB_OUTPUT}"
+            echo "::notice title=safety::Scheduled cleanup always runs in DRY RUN mode — nothing will be deleted."
+            exit 0
+          fi
+          mode="${INPUT_MODE:-dry-run}"
+          if [[ "${mode}" == "live" ]]; then
+            if [[ "${INPUT_CONFIRM:-}" != "DELETE" ]]; then
+              echo "::error title=safety::mode=live requires confirm_live=DELETE. Aborting; nothing was deleted."
+              exit 1
             fi
-            cutoff="${{ inputs.cutoff_hours || '24' }}"
-            if [[ -z "$cutoff" ]]; then cutoff="24"; fi
-          fi
-
-          echo "DELETE_BRANCHES=$DELETE_BRANCHES cutoff=$cutoff hours"
-          echo "Running cleanup (branch + runs) with full safety checks..."
-
-          # Run the Python cleanup script
-          # Use --delete flag only when live, otherwise dry-run
-          if [[ "$DELETE_BRANCHES" == "true" ]]; then
-            python3 tool/branch_cleanup.py --repo "${{ github.repository }}" --delete --cutoff-hours "$cutoff"
+            echo "::warning title=safety::LIVE deletion explicitly requested — only verified runs and merged branches are removed."
           else
-            python3 tool/branch_cleanup.py --repo "${{ github.repository }}" --cutoff-hours "$cutoff"
+            echo "mode=dry-run" >> "${GITHUB_OUTPUT}"
+            echo "::notice title=safety::DRY RUN — nothing will be deleted."
+            exit 0
           fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload cleanup log
+      - name: Run central cleanup
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          KEEP_LATEST: ${{ inputs.keep_latest }}
+          RUN_MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+          args=(
+            "--mode" "${RUN_MODE:-dry-run}"
+            "--repository" "${TARGET_REPOSITORY:-all}"
+            "--keep-latest" "${KEEP_LATEST:-20}"
+            "--reports-dir" "diagnostics"
+            "--central-repository" "${{ github.repository }}"
+            "--current-run-id" "${{ github.run_id }}"
+          )
+          if [[ "${RUN_MODE:-dry-run}" == "live" ]]; then
+            args+=("--confirm-live" "DELETE")
+          fi
+          python3 tool/central_cleanup.py "${args[@]}"
+
+      - name: Upload cleanup reports
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: cleanup-report
-          path: |
-            diagnostics/
+          path: diagnostics/
           if-no-files-found: warn
           retention-days: 7

@@ -1,0 +1,76 @@
+name: CI
+
+# Engineering gates for the central cleanup system.
+# This workflow never deletes anything and never receives the cleanup token.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Tests, syntax and workflow permissions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Python syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q tool tests
+          echo "All Python files compile."
+
+      - name: Workflow syntax and least-privilege check
+        shell: bash
+        run: python tool/check_workflow_permissions.py .github/workflows
+
+      - name: YAML syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          files = sorted(Path(".github/workflows").glob("*.y*ml"))
+          assert files, "no workflow files found"
+          for path in files:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+              print(f"valid YAML: {path}")
+          PY
+
+      - name: Unit and integration tests (no network, no deletions)
+        shell: bash
+        run: python -m pytest -q
+
+      - name: Dry-run simulation with mocked repositories
+        shell: bash
+        run: python -m pytest -q tests/test_dry_run_simulation.py -v
