@@ -184,3 +184,30 @@ def test_api_result_helpers():
     assert ApiResult(False, 403).forbidden
     assert ApiResult(False, 404).not_found
     assert not ApiResult(True, 200).forbidden
+
+
+# ---------------------------------------------------------------------------
+# Cross-repository contamination guard
+# ---------------------------------------------------------------------------
+
+
+def test_origin_matches_repository_accepts_equivalent_urls():
+    from tool.git_workspace import origin_matches_repository
+
+    for url in (
+        "https://github.com/owner/repo.git",
+        "https://github.com/owner/repo",
+        "git@github.com:owner/repo.git",
+        "ssh://git@github.com/owner/repo.git",
+        "https://github.com/OWNER/REPO.git/",
+    ):
+        assert origin_matches_repository(url, "owner/repo"), url
+
+
+def test_origin_matches_repository_rejects_other_repositories():
+    from tool.git_workspace import origin_matches_repository
+
+    assert not origin_matches_repository("https://github.com/owner/other.git", "owner/repo")
+    assert not origin_matches_repository("https://github.com/other/repo.git", "owner/repo")
+    assert not origin_matches_repository("", "owner/repo")
+    assert not origin_matches_repository("https://github.com/owner", "owner/repo")

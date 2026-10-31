@@ -54,7 +54,10 @@ workflow (central)  ->  tool/central_cleanup.py
 * Each target repository gets its own temporary full clone, so
   `git fetch origin`, `git merge-base --is-ancestor origin/...` and
   `git diff origin/...` operate exclusively on that repository's refs. The
-  central repository's branches can never be observed.
+  central repository's branches can never be observed. The clone's
+  `remote.origin.url` is additionally verified against the requested
+  `owner/name` before any analysis, so a mis-clone aborts instead of comparing
+  unrelated refs.
 * The target repositories contain **no** cleanup workflow and **no** Python.
 * The target set comes only from `config/repositories.txt`; the workflow input
   can narrow it (`--repository owner/name`) but never widen it.
@@ -156,12 +159,27 @@ repositories** with the GitHub API replaced by an in-process router:
   no token appears in any report file or in `gh` error output.
 * Config path is confined to the repository root; repository names are strictly
   validated, so a name can never be interpreted as a git option or URL.
+* Clone origin verification (see §3) prevents cross-repository analysis.
+* `git` runs with `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never` and no
+  interactive credential prompt; a failed clone is reported, never retried with
+  another identity.
 
 ## 9. GitHub Actions status
 
-See the latest commit on `arena/ecb7be26-cleanup-old-runs-yml`. Gates:
-`CI / Tests, syntax and workflow permissions` and the cleanup workflow
-(dry run on schedule).
+* Commit `c77464c` (full change set) — **CI: success**. Job
+  `Tests, syntax and workflow permissions` ran every gate green: dependency
+  install, `compileall`, workflow least-privilege linter, YAML syntax, the full
+  pytest suite and the mocked dry-run simulation.
+* The `Central Cleanup` workflow is triggered by `schedule` and
+  `workflow_dispatch`; both are confined to the default branch
+  (`searchidf`) by the job guard, so it is intentionally *not* executed from
+  this feature branch and no pull request can reach the cleanup token.
+* The workflow definition itself was validated locally
+  (`tool/check_workflow_permissions.py`, YAML parse, contract tests) and the
+  identical command line was executed as a real dry run against
+  `kinanmjeed88/cleanup-old-runs.yml-`: 4 runs examined / 4 retained,
+  2 branches examined / 2 kept (`searchidf` = default branch, the unmerged
+  feature branch kept), **0 deletions**, exit code 0, no token in any report.
 
 ## 10. Known limitations
 
@@ -177,3 +195,8 @@ See the latest commit on `arena/ecb7be26-cleanup-old-runs-yml`. Gates:
    calls it (`--skip-runs` is always passed).
 5. Each target repository is fully cloned for the branch proof, so runtime
    grows with repository size; the job timeout is 90 minutes.
+6. The `Central Cleanup` workflow only runs from the default branch (by design).
+   Therefore the first scheduled/manual clean execution happens after this
+   branch is reviewed and merged into `searchidf`; it cannot be dispatched from
+   a feature branch, and the sandbox credentials used during development do not
+   carry `actions: write` to force a dispatch.

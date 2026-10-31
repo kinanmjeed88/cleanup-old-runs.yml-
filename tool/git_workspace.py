@@ -37,6 +37,32 @@ CREDENTIAL_HELPER = (
 DEFAULT_CLONE_TIMEOUT = 900
 
 
+def origin_matches_repository(origin_url: str, repository: str) -> bool:
+    """True when a clone's ``origin`` really points at ``repository``.
+
+    Guards against ever running the branch algorithm on the wrong repository
+    (which would compare unrelated refs).
+    """
+    if not origin_url or not repository:
+        return False
+    value = origin_url.strip().rstrip("/")
+    if value.endswith(".git"):
+        value = value[: -len(".git")]
+    value = value.replace("\\", "/")
+    for prefix in ("https://", "http://", "ssh://", "git@"):
+        if value.startswith(prefix):
+            value = value[len(prefix) :]
+    if value.startswith("github.com:"):
+        value = value[len("github.com:") :]
+    elif value.startswith("github.com/"):
+        value = value[len("github.com/") :]
+    parts = [part for part in value.split("/") if part]
+    if len(parts) < 2:
+        return False
+    actual = "/".join(parts[-2:])
+    return actual.lower() == repository.strip().lower()
+
+
 class WorkspaceError(RuntimeError):
     """Raised when an isolated git context cannot be created."""
 
@@ -118,6 +144,16 @@ class GitWorkspaceFactory:
             if clone.returncode != 0:
                 raise WorkspaceError(
                     f"failed to clone {repository}: {redact(clone.stderr.strip(), self._token)}"
+                )
+
+            origin_check = self._git(
+                ["-C", str(path), "config", "--get", "remote.origin.url"], timeout=60
+            )
+            origin_url = (origin_check.stdout or "").strip()
+            if origin_check.returncode != 0 or not origin_matches_repository(origin_url, repository):
+                raise WorkspaceError(
+                    f"clone origin {origin_url!r} does not match the requested repository "
+                    f"{repository!r}; refusing to run branch analysis"
                 )
 
             # Persist *only* the env-reading helper for the child process, and
