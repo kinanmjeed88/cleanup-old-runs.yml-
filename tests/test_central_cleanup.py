@@ -553,3 +553,97 @@ def test_cli_fails_when_the_branch_script_is_missing(tmp_path: Path, monkeypatch
     monkeypatch.setenv("CLEANUP_TOKEN", "token")
 
     assert main(cli_args(tmp_path)) == EXIT_CONFIG
+
+
+def test_relative_report_path_survives_a_child_with_another_cwd(tmp_path: Path, token: str, monkeypatch):
+    """Regression: the child runs in a throw-away clone, so paths must be absolute.
+
+    A relative ``--json-report`` used to be written inside the clone and deleted
+    with it, which made every scheduled run report "no JSON report".
+    """
+    script = tmp_path / "fake_branch_cleanup.py"
+    script.write_text(
+        """import argparse, json, os
+parser = argparse.ArgumentParser()
+parser.add_argument("--repo")
+parser.add_argument("--skip-runs", action="store_true")
+parser.add_argument("--delete", action="store_true")
+parser.add_argument("--dry-run", action="store_true")
+parser.add_argument("--json-report", default="")
+args = parser.parse_args()
+open(args.json_report, "w").write(json.dumps({
+    "branches_examined": 1, "kept": 1, "deleted": 0, "planned_deletions": 0,
+    "failed": 0, "default_branch": "main",
+    "results": [{"branch": "main", "action": "keep", "reason": "default branch"}],
+    "errors": [],
+}))
+""",
+        encoding="utf-8",
+    )
+
+    class CloneRunner(central_cleanup.BranchCleanupRunner):
+        def _child_env(self):  # keep the inherited environment for the interpreter
+            import os
+
+            env = dict(os.environ)
+            env["CLEANUP_TOKEN"] = token
+            env.pop("GITHUB_STEP_SUMMARY", None)
+            return env
+
+    runner = CloneRunner(token=token, script_path=script, log=lambda _m: None)
+    reports_dir = tmp_path / "diagnostics"
+
+    # The child behaves exactly like the real one: it resolves the report path
+    # against its own working directory.
+    original_run = runner.run
+
+    def run_with_child_cwd(repository, *, live, workdir, report_path):
+        import subprocess
+
+        command = [
+            runner.python_executable,
+            str(script),
+            "--repo",
+            repository,
+            "--skip-runs",
+            "--json-report",
+            str(report_path),
+        ]
+        subprocess.run(command, cwd=str(workdir), env=runner._child_env(), check=False)
+        return original_run(
+            repository, live=live, workdir=workdir, report_path=report_path
+        )
+
+    runner.run = run_with_child_cwd  # type: ignore[assignment]
+
+    client = FakeClient()
+    client.add_repository("owner/repo", runs=build_runs(3))
+    cleanup = CentralCleanup(
+        client=client,
+        workspace_factory=FakeWorkspaceFactory(tmp_path / "ws"),
+        branch_runner=runner,
+        writer=ReportWriter(reports_dir, mode="DRY RUN"),
+        options=CleanupOptions(mode="dry-run"),
+        raw_report_dir=reports_dir / "raw",
+        log=lambda _m: None,
+        token=token,
+    )
+
+    report = cleanup.process("owner/repo")
+
+    assert report.branches_examined == 1
+    assert report.status == "ok"
+    assert (reports_dir / "raw" / "owner__repo.branches.json").is_file()
+
+
+def test_raw_report_directory_is_absolute(tmp_path: Path):
+    cleanup = CentralCleanup(
+        client=FakeClient(),
+        workspace_factory=FakeWorkspaceFactory(tmp_path / "ws"),
+        branch_runner=FakeBranchRunner(),
+        writer=ReportWriter(tmp_path / "diagnostics", mode="DRY RUN"),
+        options=CleanupOptions(mode="dry-run"),
+        raw_report_dir="diagnostics/raw",
+        log=lambda _m: None,
+    )
+    assert cleanup.raw_report_dir.is_absolute()
