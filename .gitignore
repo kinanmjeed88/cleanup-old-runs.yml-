@@ -1,0 +1,12 @@
+# Generated diagnostics / reports
+diagnostics/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pycache-check
+.venv/
+
+# Local clones created by the cleanup system
+cleanup-workspaces/

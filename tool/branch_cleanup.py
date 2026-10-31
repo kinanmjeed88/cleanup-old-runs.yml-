@@ -15,6 +15,13 @@ Usage:
   DRY_RUN=true python tool/branch_cleanup.py   # default: dry run, no deletion
 
 This script is intended to be invoked from GitHub Actions with GITHUB_TOKEN.
+
+Central multi-repository usage: tool/central_cleanup.py runs this script as a
+subprocess with the working directory set to an isolated clone of the target
+repository and GH_TOKEN set to the dedicated cleanup token. The branch decision
+algorithm below is shared verbatim between both entry points; the central
+orchestrator only reads the additive `--json-report` output.
+
 For unit tests, core decision functions are pure and not requiring network.
 """
 
@@ -426,6 +433,16 @@ def delete_branch_remote(repo: str, branch: str, dry_run: bool = True) -> bool:
 
 
 def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tuple[int, int, int]:
+    """Legacy time-based run cleanup (kept for CLI compatibility).
+
+    Deprecated: the central system keeps the newest N completed runs per
+    repository via tool/run_retention.py instead of using a time cutoff.
+    """
+    print(
+        "::warning::legacy time-based run cleanup is deprecated; "
+        "use tool/central_cleanup.py (newest-N retention) instead",
+        file=sys.stderr,
+    )
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
     current_run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -479,6 +496,23 @@ def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tup
     return deleted, skipped, failed
 
 
+def _write_json_report(path: str, payload: dict) -> None:
+    """Write the machine-readable branch report used by the central orchestrator.
+
+    The payload contains no credentials: it is built from branch names, actions
+    and reasons only.
+    """
+    if not path:
+        return
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Wrote JSON report: {target}")
+    except OSError as exc:
+        print(f"::warning::Could not write JSON report {path}: {exc}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Branch and runs cleanup with safety")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY") or os.environ.get("REPOSITORY") or "")
@@ -487,6 +521,11 @@ def main():
     parser.add_argument("--skip-runs", action="store_true", help="Skip runs cleanup")
     parser.add_argument("--skip-branches", action="store_true", help="Skip branch cleanup")
     parser.add_argument("--dry-run", action="store_true", default=None, help="Force dry-run even if --delete")
+    parser.add_argument(
+        "--json-report",
+        default="",
+        help="Optional path for a machine-readable branch decision report (contains no secrets)",
+    )
     args = parser.parse_args()
 
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "")
@@ -494,11 +533,27 @@ def main():
         print("::error::Repository not specified (set GITHUB_REPOSITORY or --repo)", file=sys.stderr)
         sys.exit(1)
 
+    report: dict = {
+        "repo": repo,
+        "dry_run": None,
+        "mode": "",
+        "default_branch": None,
+        "branches_examined": 0,
+        "kept": 0,
+        "deleted": 0,
+        "planned_deletions": 0,
+        "failed": 0,
+        "results": [],
+        "errors": [],
+    }
+
     # DRY_RUN env overrides: if DELETE_BRANCHES != true, stay dry
     env_delete = os.environ.get("DELETE_BRANCHES", "").lower() in ("1", "true", "yes")
     dry_run = not (args.delete or env_delete)
     if args.dry_run:
         dry_run = True
+    report["dry_run"] = bool(dry_run)
+    report["mode"] = "DRY RUN" if dry_run else "LIVE"
     if dry_run:
         print("Running in DRY RUN mode — no branches or runs will be deleted. Set --delete or DELETE_BRANCHES=true to enable.")
 
@@ -508,8 +563,11 @@ def main():
 
     default_branch = fetch_default_branch(repo)
     if not default_branch:
+        report["errors"].append("could not determine the default branch")
+        _write_json_report(args.json_report, report)
         print("::error::Could not determine default branch", file=sys.stderr)
         sys.exit(1)
+    report["default_branch"] = default_branch
     print(f"Repository: {repo}")
     print(f"Default branch: {default_branch}")
 
@@ -628,11 +686,23 @@ def main():
             except Exception:
                 pass
 
+        report["branches_examined"] = len(branches_api)
+        report["kept"] = kept
+        report["planned_deletions"] = sum(1 for r in results if r.action == "delete")
+        report["deleted"] = 0 if dry_run else deleted
+        report["failed"] = failed
+        report["results"] = [
+            {"branch": r.branch, "action": r.action, "reason": r.reason} for r in results
+        ]
+        if failed:
+            report["errors"].append(f"{failed} branch deletion(s) failed")
+
     # Runs cleanup
     if not args.skip_runs:
         deleted, skipped, failed = cleanup_runs(repo, cutoff_hours=args.cutoff_hours, dry_run=dry_run)
         print(f"Runs summary: deleted={deleted} skipped={skipped} failed={failed}")
 
+    _write_json_report(args.json_report, report)
     print("Cleanup finished.")
 
 

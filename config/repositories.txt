@@ -1,0 +1,18 @@
+# ---------------------------------------------------------------------------
+# Central cleanup target list
+# ---------------------------------------------------------------------------
+# One repository per line, written as `owner/name`.
+#   * blank lines and everything after `#` are ignored
+#   * duplicates are ignored
+#   * malformed entries fail the run (a typo must never silently skip a repo)
+#   * the cleanup token must have, on every repository listed here:
+#       Actions        : Read and write
+#       Contents       : Read and write
+#       Pull requests  : Read
+#       Metadata       : Read
+#
+# Adding or removing a repository requires no code change.
+# Keep this list to repositories you own or administer.
+# ---------------------------------------------------------------------------
+
+kinanmjeed88/cleanup-old-runs.yml-
