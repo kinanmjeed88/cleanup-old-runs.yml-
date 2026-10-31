@@ -22,6 +22,7 @@ TOKEN = "ghp_simulationTOKENvalue1234567890abcdef"
 
 def simulate(tmp_path: Path, *, mode: str = "dry-run"):
     client = FakeClient()
+    client.authenticated_login = "acme"
     client.add_repository("acme/alpha", runs=build_runs(75, first_id=1000))
     client.add_repository("acme/beta", runs=build_runs(32, first_id=2000))
     client.add_repository("acme/gamma", runs=build_runs(8, first_id=3000))
@@ -80,7 +81,7 @@ def test_simulated_dry_run_keeps_twenty_per_repository(tmp_path: Path):
     assert client.delete_calls == []
     assert all(call["live"] is False for call in runner.calls)
     assert all(report.runs_deleted == 0 for report in reports)
-    assert all(report.status == "ok" for report in reports)
+    assert all(report.status == "DRY RUN" for report in reports)
 
     summary = json.loads((tmp_path / "diagnostics" / "summary.json").read_text(encoding="utf-8"))
     assert summary["mode"] == "DRY RUN"
@@ -133,6 +134,7 @@ def test_simulation_never_leaks_the_token(tmp_path: Path):
 
 def test_api_failure_in_simulation_blocks_deletion(tmp_path: Path):
     client = FakeClient()
+    client.authenticated_login = "acme"
     client.add_repository("acme/alpha", runs=build_runs(75))
     client.add_repository("acme/beta", runs=build_runs(32))
     client.fail_runs_page["acme/alpha"] = 1
@@ -152,7 +154,7 @@ def test_api_failure_in_simulation_blocks_deletion(tmp_path: Path):
 
     alpha, beta = reports
     assert alpha.runs_deleted == 0
-    assert alpha.status == "failed"
+    assert alpha.status == "FAILED"
     assert beta.runs_deleted == 12  # the healthy repository is still processed
     assert {repo for repo, _ in client.delete_calls} == {"acme/beta"}
 
@@ -169,6 +171,7 @@ def test_cli_simulation_writes_reports(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
     client = FakeClient()
+    client.authenticated_login = "acme"
     client.add_repository("acme/alpha", runs=build_runs(75))
     client.add_repository("acme/beta", runs=build_runs(32))
     client.add_repository("acme/gamma", runs=build_runs(8))

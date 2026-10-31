@@ -48,27 +48,78 @@ class FakeClient:
     forbid_delete: set[str] = field(default_factory=set)
     open_pulls: dict[str, list[str]] = field(default_factory=dict)
 
+    # discovery: "login" -> "User" | "Organization"
+    accounts: dict[str, str] = field(default_factory=dict)
+    authenticated_login: str = "owner"
+    fail_accounts: set[str] = field(default_factory=set)
+
     list_calls: list[tuple[str, int]] = field(default_factory=list)
     delete_calls: list[tuple[str, int]] = field(default_factory=list)
     pull_calls: list[tuple[str, int]] = field(default_factory=list)
+    discovery_calls: list[str] = field(default_factory=list)
 
-    def add_repository(self, repo: str, *, runs: Iterable[dict] = (), can_push: bool = True) -> None:
-        self.repositories[repo] = {"default_branch": "main"}
-        self.permissions[repo] = {
-            "admin": False,
-            "maintain": False,
-            "push": can_push,
-            "triage": can_push,
-            "pull": True,
+    def add_repository(
+        self,
+        repo: str,
+        *,
+        runs: Iterable[dict] = (),
+        can_push: bool = True,
+        archived: bool = False,
+        fork: bool = False,
+        private: bool = False,
+        owner_type: str = "User",
+    ) -> None:
+        owner = repo.split("/", 1)[0]
+        self.accounts.setdefault(owner, owner_type)
+        self.repositories[repo] = {
+            "default_branch": "main",
+            "archived": archived,
+            "fork": fork,
+            "private": private,
+            "owner": {"login": owner, "type": owner_type},
+            "full_name": repo,
         }
+        if can_push:
+            self.permissions[repo] = {
+                "admin": False,
+                "maintain": False,
+                "push": True,
+                "triage": True,
+                "pull": True,
+            }
         self.runs[repo] = list(runs)
+
+    def _repo_payload(self, repo: str, *, include_permissions: bool) -> dict:
+        payload = dict(self.repositories[repo])
+        payload.setdefault("name", repo.split("/", 1)[1])
+        payload.pop("permissions", None)
+        if include_permissions and repo in self.permissions:
+            payload["permissions"] = dict(self.permissions[repo])
+        return payload
+
+    def _owned_by(self, login: str) -> list[str]:
+        return sorted(
+            repo
+            for repo in self.repositories
+            if repo.split("/", 1)[0].lower() == login.lower()
+        )
+
+    def _page(self, repos: list[str], page: int, per_page: int, *, include_permissions: bool) -> ApiResult:
+        start = (page - 1) * per_page
+        window = repos[start : start + per_page]
+        return ApiResult(
+            True,
+            200,
+            [self._repo_payload(repo, include_permissions=include_permissions) for repo in window],
+            None,
+        )
 
     # -- API surface -----------------------------------------------------
     def get_repository(self, repo: str) -> ApiResult:
         if repo in self.fail_repos or repo not in self.repositories:
             return ApiResult(False, 404, None, "gh: Not Found (HTTP 404)")
         payload = dict(self.repositories[repo])
-        payload["permissions"] = self.permissions.get(repo, {"push": True, "pull": True})
+        payload["permissions"] = self.permissions.get(repo, {"push": False, "pull": True})
         return ApiResult(True, 200, payload, None)
 
     def list_open_pulls(self, repo: str, page: int = 1, per_page: int = 1) -> ApiResult:
@@ -90,6 +141,41 @@ class FakeClient:
         start = (page - 1) * per_page
         window = all_runs[::-1][start : start + per_page]  # newest first, like GitHub
         return ApiResult(True, 200, {"total_count": len(all_runs), "workflow_runs": window}, None)
+
+    # -- discovery -------------------------------------------------------
+    def get_authenticated_user(self) -> ApiResult:
+        self.discovery_calls.append("GET /user")
+        return ApiResult(True, 200, {"login": self.authenticated_login, "type": "User"}, None)
+
+    def list_authenticated_user_repos(
+        self,
+        page: int = 1,
+        per_page: int = 100,
+        affiliation: str = "owner,collaborator,organization_member",
+    ) -> ApiResult:
+        self.discovery_calls.append(f"GET /user/repos?page={page}")
+        return self._page(self._owned_by(self.authenticated_login), page, per_page, include_permissions=True)
+
+    def list_org_repositories(
+        self, org: str, page: int = 1, per_page: int = 100, repo_type: str = "all"
+    ) -> ApiResult:
+        self.discovery_calls.append(f"GET /orgs/{org}/repos?page={page}")
+        if org in self.fail_accounts:
+            return ApiResult(False, 403, None, "gh: Forbidden (HTTP 403)")
+        if self.accounts.get(org) != "Organization":
+            return ApiResult(False, 404, None, "gh: Not Found (HTTP 404)")
+        return self._page(self._owned_by(org), page, per_page, include_permissions=True)
+
+    def list_user_repositories(
+        self, owner: str, page: int = 1, per_page: int = 100, repo_type: str = "owner"
+    ) -> ApiResult:
+        self.discovery_calls.append(f"GET /users/{owner}/repos?page={page}")
+        if owner in self.fail_accounts:
+            return ApiResult(False, 403, None, "gh: Forbidden (HTTP 403)")
+        if owner not in self.accounts:
+            return ApiResult(False, 404, None, "gh: Not Found (HTTP 404)")
+        # A public listing carries no `permissions` block.
+        return self._page(self._owned_by(owner), page, per_page, include_permissions=False)
 
     def delete_workflow_run(self, repo: str, run_id: int) -> ApiResult:
         self.delete_calls.append((repo, run_id))

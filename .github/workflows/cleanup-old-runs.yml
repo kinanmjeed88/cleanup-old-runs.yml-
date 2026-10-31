@@ -1,7 +1,11 @@
 name: Central Cleanup — Workflow Runs and Merged Branches
 
-# One central workflow that cleans every repository listed in
-# config/repositories.txt using the dedicated repository secret CLEANUP_TOKEN.
+# One central workflow that cleans every repository the cleanup token can
+# manage, using the dedicated repository secret CLEANUP_TOKEN.
+#
+# Repositories are discovered on every run (GET /user/repos plus the accounts in
+# config/accounts.txt), de-duplicated across sources and reported before any
+# work starts. config/repositories.txt is only used by discovery mode `list`.
 #
 # Safety model:
 #   * schedule        -> always DRY RUN (preview only, no deletions)
@@ -23,10 +27,24 @@ on:
           - dry-run
           - live
       repository:
-        description: "Repository from config/repositories.txt, or 'all'."
+        description: "One discovered repository (owner/name), or 'all'."
         required: false
         default: "all"
         type: string
+      discovery_mode:
+        description: "auto = every discovered repository, list = config only, union = both."
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - list
+          - union
+      discovery_only:
+        description: "Discover and report only; never clean anything."
+        required: false
+        default: false
+        type: boolean
       keep_latest:
         description: "Completed workflow runs to keep per repository."
         required: false
@@ -112,10 +130,14 @@ jobs:
           TARGET_REPOSITORY: ${{ inputs.repository }}
           KEEP_LATEST: ${{ inputs.keep_latest }}
           RUN_MODE: ${{ steps.mode.outputs.mode }}
+          DISCOVERY_MODE: ${{ inputs.discovery_mode }}
+          DISCOVERY_ONLY: ${{ inputs.discovery_only }}
         run: |
           set -euo pipefail
           args=(
             "--mode" "${RUN_MODE:-dry-run}"
+            "--discovery-mode" "${DISCOVERY_MODE:-auto}"
+            "--accounts" "config/accounts.txt"
             "--repository" "${TARGET_REPOSITORY:-all}"
             "--keep-latest" "${KEEP_LATEST:-20}"
             "--reports-dir" "diagnostics"
@@ -125,7 +147,21 @@ jobs:
           if [[ "${RUN_MODE:-dry-run}" == "live" ]]; then
             args+=("--confirm-live" "DELETE")
           fi
+          if [[ "${DISCOVERY_ONLY:-false}" == "true" ]]; then
+            args+=("--discover-only")
+          fi
           python3 tool/central_cleanup.py "${args[@]}"
+
+      - name: Show the grand total
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f diagnostics/REPORT.md ]]; then
+            sed -n '1,200p' diagnostics/REPORT.md
+          else
+            echo "::warning::no report was produced"
+          fi
 
       - name: Upload cleanup reports
         if: always()

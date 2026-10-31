@@ -23,10 +23,12 @@ Python files.
 ```
 .github/workflows/cleanup-old-runs.yml   central entry point (schedule = dry-run, dispatch = dry-run|live)
 .github/workflows/ci.yml                 test + syntax + workflow-permission gates
-config/repositories.txt                  target list (owner/name per line, # comments)
+config/accounts.txt                      accounts to discover (one login per line)
+config/repositories.txt                  optional list, used only by discovery mode `list`/`union`
 tool/branch_cleanup.py                   branch deletion algorithm — UNCHANGED decision logic
 tool/github_client.py                    token handling + `gh api` transport + redaction
 tool/run_retention.py                    "keep newest 20 completed runs" pure policy + executor
+tool/discovery.py                        repository discovery (pagination, de-duplication)
 tool/repositories.py                     config parsing / validation / selection
 tool/git_workspace.py                    isolated full clone per target repository
 tool/reports.py                          per-repository + aggregate reports
@@ -34,6 +36,40 @@ tool/central_cleanup.py                  orchestrator (multi-repository driver)
 tool/check_workflow_permissions.py       workflow least-privilege linter
 tests/                                   unit + integration tests (no network, no deletion)
 ```
+
+### Repository discovery (no hand-written list)
+
+Every execution starts with discovery; nothing is processed before the list has
+been printed and written to `diagnostics/summary.json`.
+
+| Source | Endpoint | Purpose |
+|---|---|---|
+| authenticated user | `GET /user/repos?affiliation=owner,collaborator,organization_member&visibility=all` | every repository the token can see, public and private |
+| configured account (organisation) | `GET /orgs/{login}/repos?type=all` | repositories of an organisation |
+| configured account (user) | `GET /users/{login}/repos?type=owner` | fallback when `/orgs/...` answers 404 (e.g. a personal account) |
+| scoped-token diagnostic | `GET /users/{authenticated}/repos` | compares *visible* with *token-visible* repositories and warns when a fine-grained token is limited to selected repositories |
+
+* All sources are paginated to the end (`per_page=100`); a short page ends a
+  source, a failing page marks it incomplete and is reported.
+* Entries are keyed by `full_name` (case-insensitive) and merged, so a
+  repository found by several sources appears once with every source recorded.
+* Each entry keeps `full_name`, owner login, owner type, default branch,
+  visibility, archived/fork/disabled flags, token permissions, and its sources.
+* An account that is neither a readable organisation nor a readable user
+  (403/404 on both) is reported as a *skipped source*, not as an empty account.
+* `DiscoveryResult.complete` is false when any source failed; live deletion is
+  refused in that case, because a partial list could silently hide repositories.
+
+### Per-repository statuses
+
+| Status | Meaning |
+|---|---|
+| `DISCOVERED` | in the discovery list (before processing) |
+| `ACCESSIBLE` | token verified, but no phase was executed |
+| `DRY RUN` | retention and branch analysis executed; nothing deleted |
+| `LIVE` | deletions executed (only with `--mode live --confirm-live DELETE`) |
+| `SKIPPED` | deliberately not modified: archived, read-only token, or no access — the reason is recorded |
+| `FAILED` | at least one operation or verification failed for that repository |
 
 ### Retaining the newest 20 completed workflow runs
 
@@ -74,14 +110,34 @@ orchestrator can report the reason for every branch decision.
 * Every string that reaches a log, exception or report passes through
   `redact()`.
 
+### Protections applied to discovered repositories
+
+* the **central repository** is excluded from branch cleanup (its runs are still
+  cleaned) — `--central-repository`, defaulting to `$GITHUB_REPOSITORY`;
+* **archived** repositories are skipped entirely;
+* repositories where the token has no write access are analysed and reported as
+  `SKIPPED`, never mutated, and their branch phase is not executed at all;
+* a different owner is never a reason to skip: accessibility decides;
+* a repository is never deleted, and no file inside it is ever written — the
+  branch phase only issues `DELETE /repos/{repo}/git/refs/heads/{branch}` from
+  inside a throw-away clone;
+* `--repository` only accepts a repository that discovery returned.
+
 ### Running
 
 ```bash
-# Preview only (always the default and the only scheduled mode)
+# Discovery test: print and write the discovered list, clean nothing
+python3 tool/central_cleanup.py --discover-only
+
+# Preview every discovered repository (always the default and the only
+# scheduled mode)
 python3 tool/central_cleanup.py --mode dry-run
 
-# Preview a single configured repository
+# Preview a single discovered repository
 python3 tool/central_cleanup.py --mode dry-run --repository kinanmjeed88/Scan-id
+
+# Restrict to the configured list, or extend discovery with it
+python3 tool/central_cleanup.py --discovery-mode list|union
 
 # Live deletion — requires an explicit confirmation token
 python3 tool/central_cleanup.py --mode live --confirm-live DELETE

@@ -1,0 +1,20 @@
+# ---------------------------------------------------------------------------
+# Accounts used for automatic repository discovery
+# ---------------------------------------------------------------------------
+# One GitHub login per line. Discovery always starts with `GET /user/repos`
+# (every repository the cleanup token can see); the accounts listed here add
+# the repositories of other owners the token is allowed to manage.
+#
+#   * blank lines and everything after `#` are ignored
+#   * `user:login` / `org:login` force the lookup order (optional)
+#   * without a prefix the run tries `/orgs/<login>/repos` first and falls back
+#     to `/users/<login>/repos`, so a user account works without a prefix
+#   * duplicates are ignored; malformed logins fail the run (never silent)
+#
+# A fine-grained token limited to "selected repositories" hides every other
+# repository. The run reports that difference instead of pretending the
+# account is empty.
+# ---------------------------------------------------------------------------
+
+kinanmjeed88
+techtouchAI

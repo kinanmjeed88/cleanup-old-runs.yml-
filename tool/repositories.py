@@ -56,6 +56,11 @@ class RepositoryList:
         }
 
 
+def is_valid_owner(login: str) -> bool:
+    """Strict GitHub account (user or organisation) login validation."""
+    return bool(isinstance(login, str) and _OWNER_RE.match(login))
+
+
 def is_valid_repository(repository: str) -> bool:
     """Strict ``owner/name`` validation (no URLs, no paths, no whitespace)."""
     if not isinstance(repository, str) or not repository:

@@ -211,3 +211,88 @@ different working directory). After the fix the dry run is `ok` with
    branch is reviewed and merged into `searchidf`; it cannot be dispatched from
    a feature branch, and the sandbox credentials used during development do not
    carry `actions: write` to force a dispatch.
+
+---
+
+# Addendum — automatic multi-account discovery (2026-11-01)
+
+## 11. Why discovery replaced the repository list
+
+`config/repositories.txt` was a hand-maintained list. It could only contain
+repositories somebody remembered to add, it silently ignored every other
+repository the token could manage, and it made "which repositories exist?" a
+question answered by the dashboard rather than by the token.
+
+The orchestrator now starts every run with a discovery phase
+(`tool/discovery.py`) and only then touches anything:
+
+| Source | Endpoint | Notes |
+|---|---|---|
+| authenticated user | `GET /user/repos?affiliation=owner,collaborator,organization_member&visibility=all` | public + private, owned + collaborating |
+| configured organisation | `GET /orgs/{login}/repos?type=all` | accounts from `config/accounts.txt` |
+| configured user account | `GET /users/{login}/repos?type=owner` | fallback when `/orgs/...` returns 404 (a personal account is not an organisation) |
+| scoped-token diagnostic | `GET /users/{authenticated}/repos` | detects a fine-grained token limited to *selected repositories* |
+
+* full pagination (`per_page=100`, short page ends the source);
+* de-duplication by `full_name` (case-insensitive) with every source recorded;
+* per entry: `full_name`, owner login, owner type, default branch,
+  visibility, archived/fork/disabled, token permissions, sources;
+* an unreachable account (403/404 on both endpoints) is a *skipped source*
+  with a note, a failing page makes discovery **incomplete**;
+* `DiscoveryResult.complete == False` blocks live deletion, because a partial
+  list could hide repositories.
+
+`config/repositories.txt` is still supported, but only for
+`--discovery-mode list|union`; the default `auto` mode needs no list at all.
+
+## 12. Statuses
+
+`DISCOVERED` → `ACCESSIBLE` → `DRY RUN` / `LIVE`, plus `SKIPPED` and `FAILED`.
+`SKIPPED` always carries a reason (archived, read-only token, no access,
+branch phase excluded for the central repository). `FAILED` is used only for
+real failures; a skipped repository is not a failure and does not fail the run.
+
+## 13. Real discovery + dry run (2026-11-01)
+
+Executed with the development token against the real API:
+
+* **24 repositories discovered**, `complete = yes`, 2 sources
+  (`/user/repos` → 13, `/users/techtouchAI/repos` → 11 after the
+  `/orgs/...` 404 fallback), no duplicates;
+* 13 writable (`kinanmjeed88/*`), 11 read-only (`techtouchAI/*` → `SKIPPED`,
+  discovered and reported, never mutated, branch phase not executed);
+* the central repository `kinanmjeed88/cleanup-old-runs.yml-` was processed for
+  runs but **excluded from branch cleanup** (`branches_examined = 0`);
+* 6,827 runs examined → 337 retained → **6,487 deletion candidates, 0 deleted**;
+* 319 branches examined → 319 kept → **0 deletion candidates**; 277 of them were
+  retained because branch protection could not be verified (`403`, token has no
+  `administration: read`) — the existing fail-safe rule, unchanged;
+* 0 failed repositories, exit code 0, no token in any report.
+
+## 14. New and changed files in this addendum
+
+| File | Change |
+|---|---|
+| `tool/discovery.py` | new discovery engine (sources, pagination, merge, diagnostics) |
+| `tool/github_client.py` | 4 read-only discovery endpoints |
+| `tool/reports.py` | new status vocabulary, discovery table, per-repository and aggregate reports |
+| `tool/central_cleanup.py` | discovery-first orchestration, per-repository preflight, analysis-only mode for read-only repositories, exclusion rules, `--discover-only`, `--discovery-mode`, `--limit`, `--exclude-branch-cleanup` |
+| `config/accounts.txt` | new: `kinanmjeed88`, `techtouchAI` |
+| `.github/workflows/cleanup-old-runs.yml` | `discovery_mode` / `discovery_only` inputs, `--accounts`, grand-total step, reports always uploaded |
+| `.github/workflows/ci.yml` | discovery test step |
+| `tests/test_discovery.py` | 25 new tests; suite is now 200 tests |
+| `docs/DISCOVERY_REPORT_AR.md` | Arabic discovery + dry-run report |
+| `tool/branch_cleanup.py` | **untouched** in this addendum (decision order, merge proof, delete method unchanged) |
+
+## 15. Additional limitations
+
+1. Branch deletion stays at 0 until `CLEANUP_TOKEN` can read branch protection
+   (`administration: read` or classic `repo`); without it every branch is kept
+   by design.
+2. Read-only repositories are still fully listed (runs are paginated) so the
+   report can show what *would* be deleted; this costs API calls but never
+   mutates anything.
+3. A discovery source that returns a partial page (for example a fine-grained
+   token with selected repositories) is reported, not silently trusted:
+   `complete` becomes false only for real errors, while the scoped-token
+   diagnostic names the hidden repositories.
