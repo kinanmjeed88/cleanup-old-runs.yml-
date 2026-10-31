@@ -1,0 +1,133 @@
+name: Cleanup Old Workflow Runs and Merged Branches
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no deletions, only report) — الإعداد الافتراضي الآن معاينة آمنة"
+        required: false
+        default: true
+        type: boolean
+      cutoff_hours:
+        description: "Hours before deleting completed runs"
+        required: false
+        default: "24"
+        type: string
+
+# Workflow defaults are read-only. Only the explicitly dispatched cleanup job
+# receives deletion capabilities.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: cleanup-old-workflow-runs
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Cleanup runs and branches
+    # Both scheduled and manual cleanup are confined to the repository default
+    # branch; PR and feature refs can never receive the deletion token.
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            /*
+            !/Mostmskat/
+            !/local-data/
+          sparse-checkout-cone-mode: false
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure git for branch checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin --prune --tags
+          git fetch origin "+refs/heads/*:refs/remotes/origin/*" || true
+          echo "Remote branches:"
+          git branch -r | head -n 50
+          echo "Default branch from git:"
+          git symbolic-ref refs/remotes/origin/HEAD || echo "no origin/HEAD"
+
+      - name: Show repository state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          echo "Repository: $repo"
+          default=$(gh api "repos/$repo" --jq .default_branch)
+          echo "Default branch (API): $default"
+          echo "Open PRs:"
+          gh api "repos/$repo/pulls?state=open&per_page=100" --jq '.[].head.ref' || true
+          echo "Branches (first 20):"
+          gh api "repos/$repo/branches?per_page=100" --jq '.[].name' | head -n 20 || true
+
+      - name: Run branch and runs cleanup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          # Fail closed; the guarded script below enables deletion only for an explicit manual dry_run=false dispatch.
+          DELETE_BRANCHES: 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # SAFETY: scheduled runs are now preview-only until manual review completes (P0).
+          # Deletion only occurs when workflow_dispatch is run with dry_run=false explicitly.
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            export DELETE_BRANCHES="false"
+            cutoff="${{ inputs.cutoff_hours || '24' }}"
+            echo "::notice title=safety::Scheduled cleanup is in DRY-RUN preview mode — no branches/runs will be deleted. Run workflow_dispatch with dry_run=false for live deletion."
+          else
+            if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+              export DELETE_BRANCHES="false"
+              echo "Dry run requested via input — no deletions will occur."
+            else
+              export DELETE_BRANCHES="false"
+              # Allow live only when explicitly requested via dry_run=false on dispatch
+              if [[ "${{ inputs.dry_run }}" == "false" ]]; then
+                export DELETE_BRANCHES="true"
+                echo "::warning title=safety::LIVE deletion enabled via explicit dry_run=false — proceeding with verified deletions only."
+              fi
+            fi
+            cutoff="${{ inputs.cutoff_hours || '24' }}"
+            if [[ -z "$cutoff" ]]; then cutoff="24"; fi
+          fi
+
+          echo "DELETE_BRANCHES=$DELETE_BRANCHES cutoff=$cutoff hours"
+          echo "Running cleanup (branch + runs) with full safety checks..."
+
+          # Run the Python cleanup script
+          # Use --delete flag only when live, otherwise dry-run
+          if [[ "$DELETE_BRANCHES" == "true" ]]; then
+            python3 tool/branch_cleanup.py --repo "${{ github.repository }}" --delete --cutoff-hours "$cutoff"
+          else
+            python3 tool/branch_cleanup.py --repo "${{ github.repository }}" --cutoff-hours "$cutoff"
+          fi
+
+      - name: Upload cleanup log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cleanup-report
+          path: |
+            diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
