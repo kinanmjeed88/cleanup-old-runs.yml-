@@ -181,6 +181,17 @@ repositories** with the GitHub API replaced by an in-process router:
   2 branches examined / 2 kept (`searchidf` = default branch, the unmerged
   feature branch kept), **0 deletions**, exit code 0, no token in any report.
 
+### Post-merge fix (found during the first real dry run)
+
+The first execution after the merge reported `branch cleanup produced no JSON
+report`. Root cause: `--reports-dir diagnostics` was relative, and the branch
+cleanup child process runs inside the throw-away clone, so the report was
+written into the clone and deleted with it. Fix: the reports directory and the
+per-repository branch report path are resolved to absolute paths before the
+child is spawned (plus a regression test that runs a real child process from a
+different working directory). After the fix the dry run is `ok` with
+`branches_examined=2, kept=2`.
+
 ## 10. Known limitations
 
 1. `Actions: write` cannot be verified non-destructively; a dry run reports it

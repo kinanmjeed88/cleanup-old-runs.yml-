@@ -240,6 +240,8 @@ class BranchCleanupRunner:
         workdir: str | Path,
         report_path: str | Path,
     ) -> BranchRunResult:
+        # Never hand a relative path to a process with a different cwd.
+        report_path = Path(report_path).resolve()
         if not self.script_path.is_file():
             return BranchRunResult(
                 ok=False,
@@ -363,7 +365,9 @@ class CentralCleanup:
         self.branch_runner = branch_runner
         self.writer = writer
         self.options = options
-        self.raw_report_dir = Path(raw_report_dir)
+        # Absolute: the branch cleanup child process runs inside a throw-away
+        # clone, so a relative path would be written into (and deleted with) it.
+        self.raw_report_dir = Path(raw_report_dir).resolve()
         self.token = token
         self._emit = log or (lambda msg: print(msg))
 
@@ -676,7 +680,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         script_path=script_path,
         log=log,
     )
-    writer = ReportWriter(args.reports_dir, token=token, mode=options.mode_label)
+    reports_dir = Path(args.reports_dir).resolve()
+    writer = ReportWriter(reports_dir, token=token, mode=options.mode_label)
 
     cleanup = CentralCleanup(
         client=client,
@@ -684,7 +689,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         branch_runner=branch_runner,
         writer=writer,
         options=options,
-        raw_report_dir=Path(args.reports_dir) / "raw",
+        raw_report_dir=reports_dir / "raw",
         log=log,
         token=token,
     )
