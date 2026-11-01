@@ -94,7 +94,7 @@ def test_dry_run_reports_without_deleting(tmp_path):
 
     report = cleanup.process("owner/repo")
 
-    assert report.status == "ok"
+    assert report.status == "DRY RUN"
     assert report.runs_examined == 75
     assert report.runs_retained == 20
     assert report.runs_deleted == 0
@@ -110,7 +110,7 @@ def test_live_run_deletes_exactly_the_old_runs(tmp_path):
 
     report = cleanup.process("owner/repo")
 
-    assert report.status == "ok"
+    assert report.status == "LIVE"
     assert report.runs_deleted == 55
     assert len(client.runs["owner/repo"]) == 20
     assert client.delete_calls
@@ -139,7 +139,7 @@ def test_branch_results_are_merged_into_the_report(tmp_path):
     assert runner.calls[0]["live"] is False
 
 
-def test_missing_contents_write_skips_branches_but_cleans_runs(tmp_path):
+def test_read_only_repository_is_analysed_but_never_mutated(tmp_path):
     client = FakeClient()
     client.add_repository("owner/repo", runs=build_runs(30), can_push=False)
     runner = FakeBranchRunner()
@@ -148,9 +148,26 @@ def test_missing_contents_write_skips_branches_but_cleans_runs(tmp_path):
     report = cleanup.process("owner/repo")
 
     assert report.runs_examined == 30
-    assert runner.calls == []
-    assert report.status == "failed"
-    assert any("Contents: Read and write" in failure for failure in report.failures)
+    assert report.runs_deleted == 0
+    assert client.delete_calls == []
+    assert runner.calls == []  # no write access -> no clone, no branch phase
+    assert report.status == "SKIPPED"
+    assert "read-only" in report.exclusion_reason
+    assert any("Contents: Read and write" in note for note in report.notes)
+
+
+def test_read_only_repository_never_deletes_in_live_mode(tmp_path):
+    client = FakeClient()
+    client.add_repository("owner/repo", runs=build_runs(30), can_push=False)
+    cleanup = make_cleanup(client, tmp_path, options=CleanupOptions(mode="live"))
+
+    report = cleanup.process("owner/repo")
+
+    assert report.mode == "LIVE"
+    assert report.runs_planned_deletions == 10
+    assert report.runs_deleted == 0
+    assert client.delete_calls == []
+    assert report.status == "SKIPPED"
 
 
 def test_missing_actions_read_skips_runs_but_cleans_branches(tmp_path):
@@ -164,8 +181,38 @@ def test_missing_actions_read_skips_runs_but_cleans_branches(tmp_path):
 
     assert report.runs_examined == 0
     assert len(runner.calls) == 1
-    assert report.status == "failed"
+    assert report.status == "FAILED"
     assert any("Actions: Read" in failure for failure in report.failures)
+
+
+def test_archived_repository_is_skipped(tmp_path):
+    client = FakeClient()
+    client.add_repository("owner/old", runs=build_runs(30), archived=True)
+    runner = FakeBranchRunner()
+    cleanup = make_cleanup(client, tmp_path, branch_runner=runner)
+
+    report = cleanup.process("owner/old")
+
+    assert report.status == "SKIPPED"
+    assert "archived" in report.exclusion_reason
+    assert report.runs_examined == 0
+    assert runner.calls == []
+    assert client.delete_calls == []
+
+
+def test_central_repository_keeps_its_branches_but_cleans_runs(tmp_path):
+    client = FakeClient()
+    client.add_repository("central/repo", runs=build_runs(25))
+    runner = FakeBranchRunner()
+    options = CleanupOptions(mode="dry-run", central_repository="central/repo")
+    cleanup = make_cleanup(client, tmp_path, options=options, branch_runner=runner)
+
+    report = cleanup.process("central/repo")
+
+    assert report.runs_planned_deletions == 5  # runs are still cleaned
+    assert runner.calls == []  # branches are not
+    assert any("central repository" in note for note in report.notes)
+    assert report.status == "DRY RUN"
 
 
 def test_incomplete_run_listing_deletes_nothing(tmp_path):
@@ -178,7 +225,7 @@ def test_incomplete_run_listing_deletes_nothing(tmp_path):
 
     assert report.runs_deleted == 0
     assert client.delete_calls == []
-    assert report.status == "failed"
+    assert report.status == "FAILED"
 
 
 def test_delete_permission_error_is_reported(tmp_path):
@@ -203,7 +250,7 @@ def test_workspace_failure_is_recorded_and_runs_still_processed(tmp_path):
     report = cleanup.process("owner/repo")
 
     assert report.runs_examined == 30
-    assert report.status == "failed"
+    assert report.status == "FAILED"
     assert any("isolated git workspace" in failure for failure in report.failures)
 
 
@@ -215,7 +262,7 @@ def test_branch_runner_failure_is_recorded(tmp_path):
 
     report = cleanup.process("owner/repo")
 
-    assert report.status == "failed"
+    assert report.status == "FAILED"
     assert any("branch cleanup exited with code 1" in failure for failure in report.failures)
 
 
@@ -244,16 +291,16 @@ def test_one_failure_does_not_stop_other_repositories(tmp_path):
     client = FakeClient()
     client.add_repository("owner/good", runs=build_runs(30))
     client.add_repository("owner/bad", runs=build_runs(30))
-    client.fail_repos.add("owner/bad")
+    client.forbid_runs.add("owner/bad")  # a real failure, not a hidden repository
     client.add_repository("owner/also-good", runs=build_runs(10))
     cleanup = make_cleanup(client, tmp_path)
 
     reports = cleanup.run(["owner/good", "owner/bad", "owner/also-good"])
     statuses = {report.repository: report.status for report in reports}
 
-    assert statuses["owner/good"] == "ok"
-    assert statuses["owner/bad"] == "failed"
-    assert statuses["owner/also-good"] == "ok"
+    assert statuses["owner/good"] == "DRY RUN"
+    assert statuses["owner/bad"] == "FAILED"
+    assert statuses["owner/also-good"] == "DRY RUN"
     assert reports[0].runs_examined == 30
     assert reports[2].runs_examined == 10
 
@@ -298,7 +345,7 @@ def test_unexpected_exception_is_isolated(tmp_path):
     cleanup = make_cleanup(client, tmp_path)
     reports = cleanup.run(["owner/boom"])
 
-    assert reports[0].status == "failed"
+    assert reports[0].status == "FAILED"
     assert "unexpected" in reports[0].failures[0]
 
 
@@ -357,14 +404,20 @@ def test_cli_rejects_invalid_keep_latest(config_root, monkeypatch):
     assert main(cli_args(config_root, "--keep-latest", "abc")) == EXIT_CONFIG
 
 
-def test_cli_rejects_repository_outside_config(config_root, monkeypatch):
+def test_cli_refuses_an_undiscovered_repository(config_root, monkeypatch):
     monkeypatch.setenv("CLEANUP_TOKEN", "token")
+    client = FakeClient()
+    client.add_repository("owner/a", runs=build_runs(5))
+    monkeypatch.setattr(central_cleanup, "GhCliClient", lambda **kwargs: client)
+
     assert main(cli_args(config_root, "--repository", "evil/repo")) == EXIT_CONFIG
 
 
-def test_cli_rejects_missing_config(config_root, monkeypatch):
+def test_cli_rejects_missing_config_in_list_mode(config_root, monkeypatch):
     monkeypatch.setenv("CLEANUP_TOKEN", "token")
     args = [
+        "--discovery-mode",
+        "list",
         "--config",
         "config/missing.txt",
         "--repo-root",
@@ -375,12 +428,17 @@ def test_cli_rejects_missing_config(config_root, monkeypatch):
     assert main(args) == EXIT_CONFIG
 
 
+def test_cli_rejects_invalid_selector_without_touching_the_api(config_root, monkeypatch):
+    monkeypatch.setenv("CLEANUP_TOKEN", "token")
+    assert main(cli_args(config_root, "--repository", "not a repo")) == EXIT_CONFIG
+
+
 def test_cli_rejects_invalid_config_entries(tmp_path, monkeypatch):
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "repositories.txt").write_text("owner/a\nnot valid\n", encoding="utf-8")
     monkeypatch.setenv("CLEANUP_TOKEN", "token")
 
-    assert main(cli_args(tmp_path)) == EXIT_CONFIG
+    assert main(cli_args(tmp_path, "--discovery-mode", "list")) == EXIT_CONFIG
 
 
 def test_cli_dry_run_end_to_end(config_root, monkeypatch):
@@ -423,7 +481,7 @@ def test_cli_returns_failure_when_a_repository_fails(config_root, monkeypatch):
     client = FakeClient()
     client.add_repository("owner/a", runs=build_runs(5))
     client.add_repository("owner/b", runs=build_runs(5))
-    client.fail_repos.add("owner/b")
+    client.forbid_runs.add("owner/b")
 
     monkeypatch.setattr(central_cleanup, "GhCliClient", lambda **kwargs: client)
     monkeypatch.setattr(
@@ -632,7 +690,7 @@ open(args.json_report, "w").write(json.dumps({
     report = cleanup.process("owner/repo")
 
     assert report.branches_examined == 1
-    assert report.status == "ok"
+    assert report.status == "DRY RUN"
     assert (reports_dir / "raw" / "owner__repo.branches.json").is_file()
 
 

@@ -254,6 +254,35 @@ class GhCliClient:
         return ApiResult(False, last_status, None, last_error)
 
     # -- endpoints used by the cleanup system ----------------------------
+    def get_authenticated_user(self) -> ApiResult:
+        return self.api("user")
+
+    def list_authenticated_user_repos(
+        self,
+        page: int = 1,
+        per_page: int = 100,
+        affiliation: str = "owner,collaborator,organization_member",
+    ) -> ApiResult:
+        """Every repository the token can see (private, owned, collaborating)."""
+        return self.api(
+            f"user/repos?affiliation={affiliation}&visibility=all&sort=full_name"
+            f"&per_page={int(per_page)}&page={int(page)}"
+        )
+
+    def list_org_repositories(
+        self, org: str, page: int = 1, per_page: int = 100, repo_type: str = "all"
+    ) -> ApiResult:
+        return self.api(
+            f"orgs/{org}/repos?type={repo_type}&per_page={int(per_page)}&page={int(page)}"
+        )
+
+    def list_user_repositories(
+        self, owner: str, page: int = 1, per_page: int = 100, repo_type: str = "owner"
+    ) -> ApiResult:
+        return self.api(
+            f"users/{owner}/repos?type={repo_type}&per_page={int(per_page)}&page={int(page)}"
+        )
+
     def get_repository(self, repo: str) -> ApiResult:
         return self.api(f"repos/{repo}")
 

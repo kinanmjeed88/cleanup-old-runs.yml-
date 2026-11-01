@@ -1,6 +1,11 @@
 # ---------------------------------------------------------------------------
-# Central cleanup target list
+# Optional repository list (discovery modes `list` and `union` only)
 # ---------------------------------------------------------------------------
+# Repositories are DISCOVERED automatically on every run; this file is no
+# longer required. It is only read when the workflow is started with
+# `discovery_mode = list` (use exactly these repositories) or `union`
+# (discovered repositories plus these).
+#
 # One repository per line, written as `owner/name`.
 #   * blank lines and everything after `#` are ignored
 #   * duplicates are ignored
