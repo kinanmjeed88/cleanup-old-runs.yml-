@@ -551,7 +551,7 @@ def test_failed_deletion_is_reported_and_never_falls_back_to_git_push(
         ["--repo", "owner/repo", "--skip-runs", "--delete", "--json-report", str(report_path)],
     )
 
-    assert exit_code == 0  # legacy exit semantics preserved
+    assert exit_code == 1  # operation failures must fail the process
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["failed"] == 1
     assert payload["deleted"] == 0
@@ -596,3 +596,53 @@ def test_report_contains_no_token(git_fixture, tmp_path, monkeypatch):
     )
 
     assert token not in report_path.read_text(encoding="utf-8")
+
+
+def test_protection_check_500_keeps_the_branch(git_fixture, tmp_path, monkeypatch):
+    router = ApiRouter("owner/repo", branches=["main", "merged"])
+
+    def protection_error(cmd, **kwargs):
+        if any("/protection" in str(part) for part in cmd) and "--method" not in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "gh: Server Error (HTTP 500)")
+        return router(cmd, **kwargs)
+
+    report_path = tmp_path / "branch-report.json"
+    run_main(
+        monkeypatch,
+        protection_error,
+        ["--repo", "owner/repo", "--skip-runs", "--delete", "--json-report", str(report_path)],
+    )
+    decisions = decision_map(report_path)
+    assert decisions["merged"]["action"] == "keep"
+    assert "cannot verify protection" in decisions["merged"]["reason"]
+    assert router.deletes == []
+
+
+def test_incomplete_open_pr_listing_refuses_branch_deletion(git_fixture, tmp_path, monkeypatch):
+    router = ApiRouter("owner/repo", branches=["main", "merged"])
+    monkeypatch.setattr(bc, "list_open_pr_branches", lambda repo: (set(), False))
+    report_path = tmp_path / "branch-report.json"
+    exit_code = run_main(
+        monkeypatch,
+        router,
+        ["--repo", "owner/repo", "--skip-runs", "--delete", "--json-report", str(report_path)],
+    )
+    assert exit_code == 1
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert any("open_pr_complete=False" in error for error in payload["errors"])
+    assert router.deletes == []
+
+
+def test_refresh_failure_before_delete_keeps_branch(git_fixture, tmp_path, monkeypatch):
+    router = ApiRouter("owner/repo", branches=["main", "merged"])
+    monkeypatch.setattr(bc, "refresh_remote_refs", lambda branch, default: False)
+    report_path = tmp_path / "branch-report.json"
+    run_main(
+        monkeypatch,
+        router,
+        ["--repo", "owner/repo", "--skip-runs", "--delete", "--json-report", str(report_path)],
+    )
+    decisions = decision_map(report_path)
+    assert decisions["merged"]["action"] == "keep"
+    assert "cannot refresh remote refs" in decisions["merged"]["reason"]
+    assert router.deletes == []

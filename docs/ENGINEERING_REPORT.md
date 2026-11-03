@@ -1,5 +1,12 @@
 # Engineering report — central multi-repository cleanup
 
+> **Mixed historical/current report:** sections describing the original
+> 20-run policy and earlier test totals are historical snapshots, not the
+> current suite size. Since the 2026-11-03 audit the default is **50 completed
+> runs per repository**. The current focused review is
+> [PR #4 final review (Arabic)](PR4_FINAL_REVIEW_AR.md); the current test count
+> is also stated in the README.
+
 ## 1. How the system worked before the change
 
 | Area | Previous state |
@@ -33,7 +40,7 @@ properties.
 | `tool/reports.py` | new | per-repository + aggregate JSON/Markdown reports and job summary |
 | `tool/central_cleanup.py` | new | orchestrator: token preflight, per-repository phases, failure isolation, CLI safety gates |
 | `tool/check_workflow_permissions.py` | new | least-privilege linter for all workflows (8 rules) |
-| `tests/*` (8 files, 167 tests) | new | retention, branch algorithm, orchestration, config, token safety, workflow contract, simulated dry run |
+| `tests/*` | expanded | retention, branch algorithm, orchestration, config, token safety, workflow contract, simulated dry run, reliability and workflow execution |
 | `README.md`, `docs/CENTRAL_CLEANUP.md`, `requirements-dev.txt`, `pytest.ini`, `.gitignore` | new | usage, architecture, dev dependencies |
 
 ## 3. How the system now manages several repositories
@@ -107,24 +114,31 @@ during the scan → keep, deletion via API only.
 
 ## 6. Retention test results
 
-`tests/test_run_retention.py` — 30 tests, all passing. Covered:
+Retention is exercised both as pure-policy/unit tests and through the real
+workflow Bash → Python CLI → fake GitHub API path
+(`tests/test_workflow_execution.py`). The live matrix is:
 
-* 100 completed runs → keep 20, delete 80;
-* exactly 20 → delete 0; fewer than 20 → delete 0;
-* in-progress/queued/waiting/pending/requested runs never deleted;
-* current run never deleted and does not consume a retention slot;
-* >100 results → pagination (250 runs over 3 pages, all considered);
-* `total_count` mismatch, malformed entry, failed page → **no deletion**;
-* per-repository independence (75/32/8 → 55/12/0 deletions);
-* count-based, not age-based (30 runs older than a year still keep the newest 20);
-* dry run performs no DELETE call; live run deletes exactly the plan;
-* 403 on delete → repository aborted with a clear permission error.
+| Completed runs | Deleted | Remaining |
+|---|---|---|
+| 20 | 0 | 20 |
+| 50 | 0 | 50 |
+| 51 | 1 | 50 |
+| 100 | 50 | 50 |
+| 750 | 700 | 50 |
+| 1000 | 950 | 50 |
+
+Also covered: active/current runs never deleted; pagination across many pages;
+`total_count` drift/missing/duplicate ids/malformed entry/failed page → **no
+deletion**; oldest-first deletion; 404 already-absent; 422 continues;
+401/403/429/5xx/transport failure stops the repository; post-execution
+verification mismatch/incomplete listing fails the report; permission loss
+after partial success yields `PARTIAL_FAILURE` and exit `1`.
 
 ## 7. Branch test results
 
-`tests/test_branch_algorithm.py` — 23 tests. 16 pure decision tests plus 7
-end-to-end tests that run `branch_cleanup.main()` against **real local git
-repositories** with the GitHub API replaced by an in-process router:
+`tests/test_branch_algorithm.py` combines pure decision tests with end-to-end
+tests that run `branch_cleanup.main()` against **real local git repositories**
+with the GitHub API replaced by an in-process router:
 
 * default branch, protected (flag and by name), open PR → keep;
 * real merge commit → delete;
@@ -142,11 +156,14 @@ repositories** with the GitHub API replaced by an in-process router:
 
 * Token preflight per repository (read-only probes): `Metadata: Read`,
   `Contents: Read and write` (from the repository `permissions` object),
-  `Pull requests: Read`, `Actions: Read`. Missing capabilities skip that phase
-  and are reported per repository; they are never bypassed.
-* `Actions: write` cannot be probed without deleting: it is reported as
-  `unverified` and enforced at the first deletion — a 403 aborts that
-  repository with an explicit "Actions: Read and write" message.
+  `Pull requests: Read`, `Actions: Read`. Read and write capabilities are
+  reported separately; missing capabilities skip that phase and are reported
+  per repository, never bypassed.
+* `Actions: write` cannot be probed without deleting: it is always reported as
+  `unverified`. Live mutation additionally requires an observed repository write
+  indicator (for example `permissions.push`) as a conservative gate; a 403 at
+  deletion aborts that repository with an explicit "Actions: Read and write"
+  message. No trial deletion is performed.
 * The central workflow token is `contents: read` only; `actions: write` and
   `contents: write` were removed.
 * `tool/check_workflow_permissions.py` enforces 8 least-privilege rules
@@ -166,20 +183,27 @@ repositories** with the GitHub API replaced by an in-process router:
 
 ## 9. GitHub Actions status
 
-* Commit `c77464c` (full change set) — **CI: success**. Job
-  `Tests, syntax and workflow permissions` ran every gate green: dependency
-  install, `compileall`, workflow least-privilege linter, YAML syntax, the full
-  pytest suite and the mocked dry-run simulation.
+* Earlier hardening baseline: commit `0ec5040` (PR #4) passed CI on push run
+  `41722325698` and PR run `41722397954`. The focused final review adds the
+  central 18-run regression, explicit 404/422 workflow coverage and clearer
+  counter/verification reporting; the current suite size is **252 tests**.
+  For the latest pushed SHA, use the live checks on
+  [PR #4](https://github.com/kinanmjeed88/cleanup-old-runs.yml-/pull/4). Job
+  `Tests, syntax and workflow permissions` gates dependency install,
+  `compileall`, workflow least-privilege lint, Bandit (medium/high), YAML
+  syntax, the full pytest suite, workflow Bash-to-CLI integration, the mocked
+  dry-run simulation and discovery tests.
 * The `Central Cleanup` workflow is triggered by `schedule` and
   `workflow_dispatch`; both are confined to the default branch
   (`searchidf`) by the job guard, so it is intentionally *not* executed from
   this feature branch and no pull request can reach the cleanup token.
 * The workflow definition itself was validated locally
   (`tool/check_workflow_permissions.py`, YAML parse, contract tests) and the
-  identical command line was executed as a real dry run against
-  `kinanmjeed88/cleanup-old-runs.yml-`: 4 runs examined / 4 retained,
-  2 branches examined / 2 kept (`searchidf` = default branch, the unmerged
-  feature branch kept), **0 deletions**, exit code 0, no token in any report.
+  identical command line was executed as real read-only dry runs (2026-11-04):
+  `kinanmjeed88/cleanup-old-runs.yml-` 18 runs examined / 18 retained / 0
+  candidates, and `kinanmjeed88/Scan-id` 754 examined / 752 completed / 50
+  retained / 702 candidates, **0 deletions**, exit code 0, no token in any
+  report. `Actions: Write` for `CLEANUP_TOKEN` remains unverified.
 
 ### Post-merge fix (found during the first real dry run)
 
@@ -247,10 +271,13 @@ The orchestrator now starts every run with a discovery phase
 
 ## 12. Statuses
 
-`DISCOVERED` → `ACCESSIBLE` → `DRY RUN` / `LIVE`, plus `SKIPPED` and `FAILED`.
-`SKIPPED` always carries a reason (archived, read-only token, no access,
-branch phase excluded for the central repository). `FAILED` is used only for
-real failures; a skipped repository is not a failure and does not fail the run.
+`DISCOVERED` → `DRY_RUN_SUCCESS` / `LIVE_SUCCESS`, plus `PARTIAL_FAILURE`,
+`FAILED` and `SKIPPED`. `SKIPPED` always carries a reason (archived, no write
+indicator, no access, branch phase excluded for the central repository).
+`PARTIAL_FAILURE` means some deletions succeeded but a later operation or
+verification failed; `FAILED` means the repository could not be processed safely
+or every attempted operation failed. Both unsuccessful statuses exit `1`; a
+skipped repository is not a failure and does not fail the run.
 
 ## 13. Real discovery + dry run (2026-11-01)
 
@@ -280,7 +307,7 @@ Executed with the development token against the real API:
 | `config/accounts.txt` | new: `kinanmjeed88`, `techtouchAI` |
 | `.github/workflows/cleanup-old-runs.yml` | `discovery_mode` / `discovery_only` inputs, `--accounts`, grand-total step, reports always uploaded |
 | `.github/workflows/ci.yml` | discovery test step |
-| `tests/test_discovery.py` | 25 new tests; suite is now 200 tests |
+| `tests/test_discovery.py` | discovery pagination, de-duplication and failure-mode tests (historical addendum; current suite size is in the README) |
 | `docs/DISCOVERY_REPORT_AR.md` | Arabic discovery + dry-run report |
 | `tool/branch_cleanup.py` | **untouched** in this addendum (decision order, merge proof, delete method unchanged) |
 

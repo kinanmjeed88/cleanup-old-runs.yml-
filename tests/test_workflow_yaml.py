@@ -25,9 +25,10 @@ def test_scheduled_and_manual_triggers_exist(repo_root: Path):
     inputs = triggers["workflow_dispatch"]["inputs"]
     assert inputs["mode"]["default"] == "dry-run"
     assert inputs["mode"]["options"] == ["dry-run", "live"]
-    assert inputs["keep_latest"]["default"] == "20"
+    assert inputs["keep_latest"]["default"] == "50"
     assert inputs["repository"]["default"] == "all"
     assert inputs["confirm_live"]["default"] == ""
+    assert inputs["skip_branches"]["default"] is False
 
 
 def test_schedule_is_always_a_dry_run(repo_root: Path):
@@ -37,6 +38,8 @@ def test_schedule_is_always_a_dry_run(repo_root: Path):
     # The live branch must require the explicit confirmation word.
     assert '!= "DELETE"' in text
     assert 'echo "mode=${mode}"' in text
+    assert 'if [[ "${SKIP_BRANCHES:-false}" == "true" ]]' in text
+    assert 'args+=("--skip-branches")' in text
 
 
 def test_workflow_token_is_read_only(repo_root: Path):

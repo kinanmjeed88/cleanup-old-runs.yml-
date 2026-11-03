@@ -13,11 +13,14 @@ Safety rules (all fail *closed* — an unsure case keeps the run):
    requested) are never deleted.
 3. Runs whose status, id or ``created_at`` cannot be parsed are never deleted,
    because they cannot be ordered reliably.
-4. If the listing could not be completed (a page failed, the reported
-   ``total_count`` was not reached, or an entry was malformed), nothing is
+4. If the listing could not be completed and verified (a page failed, the
+   reported ``total_count`` drifted or disagreed with the collected rows, an
+   entry was malformed, or an id was duplicated across pages), nothing is
    deleted for that repository.
 5. Ordering is per repository: ``keep_latest`` is never applied to a pool that
    mixes repositories.
+6. Deletion candidates are executed oldest-first, so a partial failure leaves
+   the newer eligible runs intact and the operation is resumable.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-DEFAULT_KEEP_LATEST = 20
+DEFAULT_KEEP_LATEST = 50
 MIN_KEEP_LATEST = 1
 MAX_KEEP_LATEST = 10_000
 
@@ -45,6 +48,10 @@ REASON_UNVERIFIABLE_ID = "unverifiable run id"
 REASON_UNVERIFIABLE_STATUS = "unverifiable status"
 REASON_UNVERIFIABLE_CREATED_AT = "unverifiable created_at"
 REASON_OLDER_THAN_RETENTION = "older than the newest {keep} completed runs"
+
+# HTTP failures that stop the remaining deletions for one repository.  404 is
+# deliberately absent: it is an idempotent "already gone" result, not a failure.
+STOP_DELETE_STATUSES = frozenset({401, 403, 429, 500, 502, 503, 504})
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,9 @@ class RetentionPlan:
     delete: list[WorkflowRun] = field(default_factory=list)
     excluded: list[ExcludedRun] = field(default_factory=list)
     examined: int = 0
+    completed_count: int = 0
+    active_count: int = 0
+    unverifiable_count: int = 0
     complete: bool = True
     errors: list[str] = field(default_factory=list)
     abort_reason: Optional[str] = None
@@ -145,6 +155,9 @@ class RetentionPlan:
             "repository": self.repository,
             "keep_latest": self.keep_latest,
             "examined": self.examined,
+            "completed": self.completed_count,
+            "active": self.active_count,
+            "unverifiable": self.unverifiable_count,
             "retained": len(self.keep),
             "deletion_candidates": len(self.delete),
             "excluded": len(self.excluded),
@@ -166,6 +179,7 @@ class RunListing:
     errors: list[str] = field(default_factory=list)
     pages_read: int = 0
     reported_total: Optional[int] = None
+    duplicate_ids: list[int] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -173,6 +187,7 @@ class RunListing:
             "pages_read": self.pages_read,
             "reported_total": self.reported_total,
             "complete": self.complete,
+            "duplicate_ids": list(self.duplicate_ids),
             "errors": list(self.errors),
         }
 
@@ -204,6 +219,14 @@ def plan_retention(
     plan.examined = len(runs)
     plan.errors = list(errors or [])
     plan.complete = bool(complete)
+
+    for run in runs:
+        if run.status == COMPLETED_STATUS:
+            plan.completed_count += 1
+        elif run.status in ACTIVE_STATUSES:
+            plan.active_count += 1
+        else:
+            plan.unverifiable_count += 1
 
     try:
         validate_keep_latest(keep_latest)
@@ -241,6 +264,8 @@ def plan_retention(
             plan.excluded.append(ExcludedRun(run, REASON_UNVERIFIABLE_CREATED_AT))
             continue
         if run.id in seen_ids:
+            # fetch_all_runs already fails closed on duplicates; this is a
+            # second guard for callers that build a plan from cached rows.
             plan.excluded.append(ExcludedRun(run, REASON_DUPLICATE))
             continue
         seen_ids.add(run.id)
@@ -250,7 +275,8 @@ def plan_retention(
     ordered.sort(key=lambda item: (item[0], item[1]), reverse=True)
 
     plan.keep = [item[2] for item in ordered[:keep_latest]]
-    plan.delete = [item[2] for item in ordered[keep_latest:]]
+    # Oldest first: a stop midway through a live run preserves newer history.
+    plan.delete = [item[2] for item in reversed(ordered[keep_latest:])]
     return plan
 
 
@@ -261,13 +287,16 @@ def fetch_all_runs(
     per_page: int = PER_PAGE,
     max_pages: int = MAX_PAGES,
 ) -> RunListing:
-    """Paginate ``actions/runs`` until the listing is exhausted.
+    """Paginate ``actions/runs`` until a *stable, complete* snapshot is read.
 
-    Any failure marks the listing incomplete; the caller must then skip
-    deletion for this repository. No assumption is made that the first page
-    holds every run.
+    Any failure, malformed row, duplicate id, drifting ``total_count`` or final
+    count mismatch marks the listing incomplete.  The caller must then skip
+    deletion for this repository.  Concurrent creation/deletion during the scan
+    is therefore treated as an unsafe partial view, not silently normalised.
     """
     listing = RunListing()
+    seen_ids: set[int] = set()
+    expected_total: Optional[int] = None
     page = 1
     while page <= max_pages:
         result = client.list_workflow_runs(repository, page=page, per_page=per_page)
@@ -292,14 +321,35 @@ def fetch_all_runs(
         listing.pages_read = page
         total = payload.get("total_count")
         if isinstance(total, int) and not isinstance(total, bool):
-            listing.reported_total = total
+            if expected_total is None:
+                expected_total = total
+                listing.reported_total = total
+            elif total != expected_total:
+                listing.complete = False
+                listing.errors.append(
+                    f"workflow runs total_count changed during pagination "
+                    f"({expected_total} -> {total} on page {page}); refusing an unstable snapshot"
+                )
+                return listing
+        else:
+            listing.complete = False
+            listing.errors.append(f"workflow runs page {page} has no valid `total_count`")
+            return listing
 
         for raw in raw_runs:
             run = WorkflowRun.from_api(raw)
             if run.id is None or not run.status:
-                # Record it so it is visible and excluded, never silently dropped.
                 listing.complete = False
                 listing.errors.append(f"unparseable workflow run on page {page}: {raw!r}"[:500])
+            elif run.id in seen_ids:
+                listing.complete = False
+                listing.duplicate_ids.append(run.id)
+                listing.errors.append(
+                    f"duplicate workflow run id {run.id} on page {page}; "
+                    "pagination is not a trustworthy snapshot"
+                )
+            else:
+                seen_ids.add(run.id)
             listing.runs.append(run)
 
         if len(raw_runs) < per_page:
@@ -313,11 +363,11 @@ def fetch_all_runs(
         )
         return listing
 
-    if listing.reported_total is not None and len(listing.runs) < listing.reported_total:
+    if expected_total is not None and len(listing.runs) != expected_total:
         listing.complete = False
         listing.errors.append(
             f"collected {len(listing.runs)} runs but the API reported total_count="
-            f"{listing.reported_total}; listing is incomplete"
+            f"{expected_total}; listing is incomplete"
         )
     return listing
 
@@ -325,6 +375,7 @@ def fetch_all_runs(
 @dataclass
 class RetentionOutcome:
     deleted: list[int] = field(default_factory=list)
+    already_absent: list[int] = field(default_factory=list)
     planned: list[int] = field(default_factory=list)
     failed: list[tuple[int, str]] = field(default_factory=list)
     aborted_reason: Optional[str] = None
@@ -333,6 +384,26 @@ class RetentionOutcome:
     @property
     def errors(self) -> list[str]:
         return [message for _, message in self.failed]
+
+    @property
+    def resolved(self) -> list[int]:
+        """Ids reported absent by DELETE (204/200) or already absent (404).
+
+        This is an execution result, not independent proof: the post-execution
+        re-list must confirm that every resolved id is actually absent.
+        """
+        return [*self.deleted, *self.already_absent]
+
+    @property
+    def failed_ids(self) -> list[int]:
+        """Ids whose DELETE attempt failed; these are never successes."""
+        return [run_id for run_id, _message in self.failed]
+
+    @property
+    def unattempted(self) -> list[int]:
+        """Planned ids not attempted after an early stop, in plan order."""
+        finished = set(self.resolved) | set(self.failed_ids)
+        return [run_id for run_id in self.planned if run_id not in finished]
 
 
 def apply_retention(
@@ -345,8 +416,13 @@ def apply_retention(
 ) -> RetentionOutcome:
     """Execute (or simulate) the deletions of a plan.
 
-    On a permission failure the remaining deletions for this repository are
-    abandoned rather than retried, and the failure is reported verbatim.
+    * 204/200 success increments ``deleted``.
+    * A run-specific DELETE 404 increments ``already_absent`` (idempotent
+      resume, not a deletion).  The later re-list must confirm absence; a 404
+      is not treated as proof that this process deleted the run.
+    * 401/403/429/5xx/transport uncertainty stops the repository.
+    * 422 and other per-run client errors are recorded as failures and the loop
+      continues.  Continuing never converts a failed DELETE into a success.
     """
     emit = log or (lambda msg: print(msg))
     outcome = RetentionOutcome(planned=[run.id for run in plan.delete if run.id is not None])
@@ -363,15 +439,22 @@ def apply_retention(
             emit(f"[DRY RUN] would delete run {run.id} | {run.created_at} | {run.name}")
             continue
         result = client.delete_workflow_run(repository, run.id)
-        if result.ok:
-            outcome.deleted.append(run.id)
-            emit(f"Deleted run {run.id} | {run.created_at} | {run.name}")
+        if result.ok or result.not_found:
+            if result.status == 404:
+                outcome.already_absent.append(run.id)
+                emit(f"Run {run.id} was already absent (HTTP 404); counted as resolved, not deleted")
+            else:
+                outcome.deleted.append(run.id)
+                emit(f"Deleted run {run.id} | {run.created_at} | {run.name}")
             continue
+
         outcome.failed.append((run.id, f"delete failed (status {result.status}): {result.error}"))
-        if result.forbidden:
+        if result.status in STOP_DELETE_STATUSES or result.status is None:
+            label = f"HTTP {result.status}" if result.status is not None else "transport failure"
             outcome.stop_reason = (
-                "GitHub refused the deletion (403). The cleanup token needs `Actions: Read and write` "
-                f"on {repository}; no further runs were deleted in this repository."
+                f"GitHub deletion stopped for run {run.id} ({label}). "
+                "Check CLEANUP_TOKEN validity, `Actions: Read and write`, rate limits and network "
+                f"on {repository}; no further runs were attempted in this repository."
             )
             emit(f"::error::{repository}: {outcome.stop_reason}")
             break
@@ -380,12 +463,78 @@ def apply_retention(
     return outcome
 
 
+def verify_after_execution(
+    client: Any,
+    repository: str,
+    plan: RetentionPlan,
+    outcome: RetentionOutcome,
+) -> dict:
+    """Re-list the repository after a live execution and verify the end state.
+
+    Returns a JSON-friendly verification record.  New runs created during the
+    cleanup are reported but are not themselves a failure; missing protected
+    runs or still-present resolved ids are mismatches.  Failed and unattempted
+    candidates remain expected survivors and are reported explicitly, so a
+    partial execution is never described as though every candidate disappeared.
+    ``status=verified`` only means these end-state invariants were checked; the
+    repository can still be ``PARTIAL_FAILURE`` because of recorded failures.
+    """
+    listing = fetch_all_runs(client, repository)
+    resolved = set(outcome.resolved)
+    failed_ids = set(outcome.failed_ids)
+    unattempted_ids = set(outcome.unattempted)
+    protected = {run.id for run in plan.keep if run.id is not None}
+    protected.update(
+        item.run.id
+        for item in plan.excluded
+        if item.run.id is not None and item.reason != REASON_DUPLICATE
+    )
+    unresolved = failed_ids | unattempted_ids
+    record: dict[str, Any] = {
+        "status": "incomplete",
+        "listing_complete": listing.complete,
+        "remaining_total": len(listing.runs),
+        "expected_remaining": len(protected | unresolved),
+        "resolved_ids": list(outcome.resolved),
+        "failed_ids": sorted(failed_ids),
+        "unattempted_ids": sorted(unattempted_ids),
+        "still_present_resolved_ids": [],
+        "still_present_failed_ids": [],
+        "still_present_unattempted_ids": [],
+        "missing_protected_ids": [],
+        "new_run_ids": [],
+        "errors": list(listing.errors),
+    }
+    if not listing.complete:
+        return record
+
+    present = {run.id for run in listing.runs if run.id is not None}
+    original = {run.id for run in plan.keep + plan.delete if run.id is not None}
+    original.update(item.run.id for item in plan.excluded if item.run.id is not None)
+
+    record["still_present_resolved_ids"] = sorted(resolved & present)
+    record["still_present_failed_ids"] = sorted(failed_ids & present)
+    record["still_present_unattempted_ids"] = sorted(unattempted_ids & present)
+    record["missing_protected_ids"] = sorted(protected - present)
+    record["new_run_ids"] = sorted(present - original)
+    if record["still_present_resolved_ids"] or record["missing_protected_ids"]:
+        record["status"] = "mismatch"
+    else:
+        record["status"] = "verified"
+    return record
+
+
 def summarise(plan: RetentionPlan, outcome: RetentionOutcome) -> dict:
     """Counters used by the report layer."""
     return {
         "runs_examined": plan.examined,
+        "runs_completed": plan.completed_count,
+        "runs_active": plan.active_count,
+        "runs_unverifiable": plan.unverifiable_count,
         "runs_retained": len(plan.keep),
         "runs_deleted": len(outcome.deleted),
+        "runs_already_absent": len(outcome.already_absent),
+        "runs_resolved": len(outcome.resolved),
         "runs_planned_deletions": len(outcome.planned),
         "runs_excluded": len(plan.excluded),
         "runs_failed": len(outcome.failed),

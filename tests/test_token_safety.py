@@ -108,6 +108,7 @@ def test_delete_treats_404_as_success(token: str):
     result = client.delete_workflow_run("o/r", 5)
 
     assert result.ok is True
+    assert result.status == 404  # idempotent absence, not a successful DELETE
 
 
 def test_branch_runner_environment_is_sanitised(token: str, monkeypatch):
@@ -211,3 +212,20 @@ def test_origin_matches_repository_rejects_other_repositories():
     assert not origin_matches_repository("https://github.com/other/repo.git", "owner/repo")
     assert not origin_matches_repository("", "owner/repo")
     assert not origin_matches_repository("https://github.com/owner", "owner/repo")
+
+
+def test_delete_422_is_a_visible_non_retried_failure(token: str):
+    calls = {"n": 0}
+
+    def runner(cmd, env, timeout):
+        calls["n"] += 1
+        return subprocess.CompletedProcess(cmd, 1, "", "gh: Unprocessable Entity (HTTP 422)")
+
+    client = GhCliClient(token=token, runner=runner, sleep=lambda _s: None, log=lambda _m: None)
+    result = client.delete_workflow_run("o/r", 5)
+
+    assert result.ok is False
+    assert result.status == 422
+    assert result.transport_error is False
+    assert "422" in result.error
+    assert calls["n"] == 1

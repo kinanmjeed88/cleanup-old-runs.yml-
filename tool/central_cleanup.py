@@ -7,7 +7,7 @@ Every execution:
    (``tool/discovery.py``) and prints them before doing anything else.
 2. **Preflights** the token per repository: Metadata read, Contents write,
    Pull requests read, Actions read. Nothing is mutated without write access.
-3. **Keeps the newest N (default 20) completed workflow runs** per repository
+3. **Keeps the newest N (default 50) completed workflow runs** per repository
    and deletes the older ones — ``tool/run_retention.py``.
 4. **Deletes merged branches** with the unchanged decision algorithm in
    ``tool/branch_cleanup.py``, inside an isolated full clone of each repository.
@@ -51,10 +51,7 @@ from tool.github_client import (
 )
 from tool.reports import (
     MAX_LISTED_ITEMS,
-    STATUS_ACCESSIBLE,
-    STATUS_DRY_RUN,
-    STATUS_FAILED,
-    STATUS_LIVE,
+    UNSUCCESSFUL_STATUSES,
     BranchDecision,
     RepoReport,
     ReportWriter,
@@ -74,6 +71,7 @@ from tool.run_retention import (
     plan_retention,
     summarise,
     validate_keep_latest,
+    verify_after_execution,
 )
 
 EXIT_OK = 0
@@ -108,8 +106,10 @@ class AccessReport:
     fatal_error: Optional[str] = None
     fatal_status: Optional[int] = None
     can_manage_runs: bool = False
+    can_read_runs: bool = False
     can_manage_branches: bool = False
     contents_write: bool = False
+    actions_write_status: str = "unverified"
     default_branch: Optional[str] = None
     owner_login: str = ""
     owner_type: str = ""
@@ -128,9 +128,13 @@ class AccessReport:
 def check_repository_access(client: Any, repository: str) -> AccessReport:
     """Verify the token's capabilities on one repository (read-only probes).
 
-    ``Actions: write`` cannot be proven without performing a deletion, so it is
-    reported as ``unverified`` and enforced at the first deletion (a 403 aborts
-    that repository).
+    Read and write capabilities are reported separately.  The repository read
+    probes do not expose the token's ``Actions: write`` grant, so it is reported
+    as ``unverified`` (the token owner can confirm the configured grant in
+    GitHub's token settings).  As a conservative preflight, live mutation also
+    requires a repository write indicator (``push``/``maintain``/``admin``);
+    this is not proof of Actions write.  In live mode the first real deletion is
+    the enforcement point; a 401/403 aborts that repository.
     """
     access = AccessReport(repository=repository)
 
@@ -175,9 +179,11 @@ def check_repository_access(client: Any, repository: str) -> AccessReport:
             "contents",
             "write",
             "ok" if contents_write else "missing",
-            "token can push to the repository"
+            "token has a repository write indicator (push/maintain/admin); "
+            "required for branch cleanup and used as a conservative live-mutation gate"
             if contents_write
-            else "token has no write access (read-only); deletions require `Contents: Read and write`",
+            else "no repository write indicator; branch cleanup is skipped and live mutation "
+            "is refused conservatively (Actions write remains separately unverified)",
         )
     )
 
@@ -211,13 +217,16 @@ def check_repository_access(client: Any, repository: str) -> AccessReport:
             "actions",
             "write",
             "unverified",
-            "write access cannot be probed without deleting a run; "
-            "it is verified at the first deletion and a 403 aborts the repository",
+            "repository read probes do not expose the Actions write grant; "
+            "confirm it in the token settings. In live mode the first deletion "
+            "enforces it and a 401/403 aborts the repository",
         )
     )
 
     access.can_manage_runs = runs_ok
+    access.can_read_runs = runs_ok
     access.can_manage_branches = contents_write and pulls_ok
+    access.actions_write_status = "unverified"
     return access
 
 
@@ -476,16 +485,18 @@ class CentralCleanup:
             return report
 
         writable = access.contents_write
+        report.discovery_status = "accessible"
         if not writable:
             report.add_note(
-                "token has read-only access: retention is analysed but nothing is deleted, and the "
-                "branch phase is skipped because no branch could be removed"
+                "no repository write indicator: retention is analysed in preview, live mutation is "
+                "refused conservatively, and the branch phase is skipped. Actions read/write are "
+                "reported separately; Actions write is not proven by this indicator."
             )
 
         executed_any_phase = False
 
         if self.options.run_runs:
-            if not access.can_manage_runs:
+            if not access.can_read_runs:
                 report.add_failure(
                     "skipped workflow-run retention: `Actions: Read` is not available to the cleanup token"
                 )
@@ -508,26 +519,17 @@ class CentralCleanup:
                     "branch cleanup skipped: requires `Contents: Read and write` and `Pull requests: Read`"
                 )
             elif not writable:
-                report.add_note("branch cleanup skipped: read-only token")
+                report.add_note("branch cleanup skipped: no repository write indicator")
             else:
                 self._process_branches(meta.full_name, report)
                 executed_any_phase = True
 
-        # Final status: failures win, then exclusions, then the executed mode.
-        if report.failures:
-            report.status = STATUS_FAILED
-        elif not writable:
+        report.finalise_status(live=self.options.live, executed_any_phase=executed_any_phase)
+        if report.status not in UNSUCCESSFUL_STATUSES and not writable:
             report.skip(
-                "read-only access: nothing can be deleted with this token "
-                "(needs `Actions: Read and write` and `Contents: Read and write`)"
+                "no repository write indicator: live mutation refused conservatively; "
+                "branch cleanup requires Contents write and Actions write remains unverified"
             )
-        elif self.options.live:
-            report.status = STATUS_LIVE
-        elif executed_any_phase:
-            report.status = STATUS_DRY_RUN
-        else:
-            report.status = STATUS_ACCESSIBLE
-
         return report
 
     # -- runs -------------------------------------------------------------
@@ -552,13 +554,30 @@ class CentralCleanup:
         outcome = apply_retention(self.client, repository, plan, dry_run=dry_run, log=self.log)
 
         report.runs_examined = plan.examined
+        report.runs_completed = plan.completed_count
+        report.runs_active = plan.active_count
+        report.runs_unverifiable = plan.unverifiable_count
         report.runs_retained = len(plan.keep)
         report.runs_deleted = len(outcome.deleted)
+        report.runs_already_absent = len(outcome.already_absent)
         report.runs_planned_deletions = len(outcome.planned)
         report.runs_excluded = len(plan.excluded)
         report.runs_failed = len(outcome.failed)
         report.retention = summarise(plan, outcome)
         report.excluded_runs = [item.as_dict() for item in plan.excluded[:MAX_LISTED_ITEMS]]
+
+        if not dry_run and outcome.planned and not plan.aborted:
+            verification = verify_after_execution(self.client, repository, plan, outcome)
+            report.verification = verification
+            report.runs_remaining = verification.get("remaining_total")
+            if verification.get("status") != "verified":
+                report.add_failure(
+                    f"post-execution verification {verification.get('status')}: "
+                    f"{json.dumps(verification, ensure_ascii=False)}"
+                )
+        else:
+            report.verification = {"status": "not_attempted"}
+            report.runs_remaining = plan.examined - len(outcome.resolved)
 
         for error in listing.errors:
             report.add_failure(error)
@@ -570,9 +589,12 @@ class CentralCleanup:
             report.add_failure(f"run {run_id}: {message}")
 
         self.log(
-            f"Runs: examined={report.runs_examined} retained={report.runs_retained} "
-            f"deleted={report.runs_deleted} planned={report.runs_planned_deletions} "
-            f"excluded={report.runs_excluded} failed={report.runs_failed}"
+            f"Runs: examined={report.runs_examined} completed={report.runs_completed} "
+            f"active={report.runs_active} retained={report.runs_retained} "
+            f"deleted={report.runs_deleted} already_absent={report.runs_already_absent} "
+            f"planned={report.runs_planned_deletions} excluded={report.runs_excluded} "
+            f"failed={report.runs_failed} remaining={report.runs_remaining} "
+            f"verification={report.verification.get('status')}"
         )
 
     # -- branches ---------------------------------------------------------
@@ -783,7 +805,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-latest",
         default=str(DEFAULT_KEEP_LATEST),
-        help="completed workflow runs to keep per repository (default 20)",
+        help=f"completed workflow runs to keep per repository (default {DEFAULT_KEEP_LATEST})",
     )
     parser.add_argument("--reports-dir", default="diagnostics", help="directory for reports")
     parser.add_argument(
@@ -992,11 +1014,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     reports = cleanup.run(selected)
 
-    failed = [report for report in reports if report.status == STATUS_FAILED]
+    failed = [report for report in reports if report.status in UNSUCCESSFUL_STATUSES]
     totals = aggregate(reports)
     log(
         "Central cleanup finished — "
-        f"repositories={len(reports)} failed={len(failed)} skipped={totals['repositories_skipped']} "
+        f"repositories={len(reports)} failed={totals['repositories_failed']} "
+        f"partial={totals['repositories_partial']} skipped={totals['repositories_skipped']} "
         f"runs_deleted={totals['runs_deleted']} runs_planned={totals['runs_planned_deletions']} "
         f"branches_deleted={totals['branches_deleted']} "
         f"branches_planned={totals['branches_planned_deletions']}"

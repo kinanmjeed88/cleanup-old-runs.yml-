@@ -45,10 +45,15 @@ on:
         required: false
         default: false
         type: boolean
-      keep_latest:
-        description: "Completed workflow runs to keep per repository."
+      skip_branches:
+        description: "Skip merged-branch cleanup. Use true for a runs-only cleanup."
         required: false
-        default: "20"
+        default: false
+        type: boolean
+      keep_latest:
+        description: "Completed workflow runs to keep per repository (default 50)."
+        required: false
+        default: "50"
         type: string
       confirm_live:
         description: "Type DELETE to authorize live deletions."
@@ -70,7 +75,7 @@ jobs:
     # Scheduled and manual cleanup are confined to the default branch, so a pull
     # request or feature ref can never reach the cleanup token.
     if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -80,7 +85,7 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout central repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # Never persist the workflow token into the git config.
           persist-credentials: false
@@ -105,23 +110,36 @@ jobs:
           INPUT_CONFIRM: ${{ inputs.confirm_live }}
         run: |
           set -euo pipefail
+          # The trigger is authoritative: scheduled runs can never opt into live.
           if [[ "${EVENT_NAME}" == "schedule" ]]; then
             echo "mode=dry-run" >> "${GITHUB_OUTPUT}"
             echo "::notice title=safety::Scheduled cleanup always runs in DRY RUN mode — nothing will be deleted."
             exit 0
           fi
-          mode="${INPUT_MODE:-dry-run}"
-          if [[ "${mode}" == "live" ]]; then
-            if [[ "${INPUT_CONFIRM:-}" != "DELETE" ]]; then
-              echo "::error title=safety::mode=live requires confirm_live=DELETE. Aborting; nothing was deleted."
-              exit 1
-            fi
-            echo "::warning title=safety::LIVE deletion explicitly requested — only verified runs and merged branches are removed."
-          else
-            echo "mode=dry-run" >> "${GITHUB_OUTPUT}"
-            echo "::notice title=safety::DRY RUN — nothing will be deleted."
-            exit 0
+          if [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
+            echo "::error title=safety::cleanup requires schedule or workflow_dispatch; refusing event ${EVENT_NAME}. Nothing was deleted."
+            exit 1
           fi
+          mode="${INPUT_MODE:-dry-run}"
+          # Never silently reinterpret an unexpected manual selection.
+          case "${mode}" in
+            dry-run)
+              echo "::notice title=safety::DRY RUN — nothing will be deleted."
+              ;;
+            live)
+              if [[ "${INPUT_CONFIRM:-}" != "DELETE" ]]; then
+                echo "::error title=safety::mode=live requires confirm_live=DELETE. Aborting; nothing was deleted."
+                exit 1
+              fi
+              echo "::warning title=safety::LIVE deletion explicitly requested — only verified runs and merged branches are removed."
+              ;;
+            *)
+              echo "::error title=safety::invalid mode ${mode}; expected dry-run or live. Nothing was deleted."
+              exit 1
+              ;;
+          esac
+          echo "event_name=${EVENT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "requested_mode=${mode}" >> "${GITHUB_OUTPUT}"
           echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
 
       - name: Run central cleanup
@@ -132,6 +150,7 @@ jobs:
           RUN_MODE: ${{ steps.mode.outputs.mode }}
           DISCOVERY_MODE: ${{ inputs.discovery_mode }}
           DISCOVERY_ONLY: ${{ inputs.discovery_only }}
+          SKIP_BRANCHES: ${{ inputs.skip_branches }}
         run: |
           set -euo pipefail
           args=(
@@ -139,7 +158,7 @@ jobs:
             "--discovery-mode" "${DISCOVERY_MODE:-auto}"
             "--accounts" "config/accounts.txt"
             "--repository" "${TARGET_REPOSITORY:-all}"
-            "--keep-latest" "${KEEP_LATEST:-20}"
+            "--keep-latest" "${KEEP_LATEST:-50}"
             "--reports-dir" "diagnostics"
             "--central-repository" "${{ github.repository }}"
             "--current-run-id" "${{ github.run_id }}"
@@ -149,6 +168,9 @@ jobs:
           fi
           if [[ "${DISCOVERY_ONLY:-false}" == "true" ]]; then
             args+=("--discover-only")
+          fi
+          if [[ "${SKIP_BRANCHES:-false}" == "true" ]]; then
+            args+=("--skip-branches")
           fi
           python3 tool/central_cleanup.py "${args[@]}"
 
@@ -165,7 +187,7 @@ jobs:
 
       - name: Upload cleanup reports
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: cleanup-report
           path: diagnostics/
