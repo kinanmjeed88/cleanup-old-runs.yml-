@@ -181,20 +181,23 @@ repositories** with the GitHub API replaced by an in-process router:
 
 ## 9. GitHub Actions status
 
-* Commit `c77464c` (full change set) — **CI: success**. Job
+* Commit `0ec5040` (full change set, PR #4) — **CI: success** on both the push
+  run (`41722325698`) and the pull-request run (`41722397954`). Job
   `Tests, syntax and workflow permissions` ran every gate green: dependency
-  install, `compileall`, workflow least-privilege linter, YAML syntax, the full
-  pytest suite and the mocked dry-run simulation.
+  install, `compileall`, workflow least-privilege linter, Bandit security scan,
+  YAML syntax, the full pytest suite (243 tests), the workflow Bash-to-CLI
+  integration tests, the mocked dry-run simulation and the discovery tests.
 * The `Central Cleanup` workflow is triggered by `schedule` and
   `workflow_dispatch`; both are confined to the default branch
   (`searchidf`) by the job guard, so it is intentionally *not* executed from
   this feature branch and no pull request can reach the cleanup token.
 * The workflow definition itself was validated locally
   (`tool/check_workflow_permissions.py`, YAML parse, contract tests) and the
-  identical command line was executed as a real dry run against
-  `kinanmjeed88/cleanup-old-runs.yml-`: 4 runs examined / 4 retained,
-  2 branches examined / 2 kept (`searchidf` = default branch, the unmerged
-  feature branch kept), **0 deletions**, exit code 0, no token in any report.
+  identical command line was executed as real read-only dry runs (2026-11-04):
+  `kinanmjeed88/cleanup-old-runs.yml-` 18 runs examined / 18 retained / 0
+  candidates, and `kinanmjeed88/Scan-id` 754 examined / 752 completed / 50
+  retained / 702 candidates, **0 deletions**, exit code 0, no token in any
+  report. `Actions: Write` for `CLEANUP_TOKEN` remains unverified.
 
 ### Post-merge fix (found during the first real dry run)
 
