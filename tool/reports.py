@@ -7,13 +7,13 @@ and appended to ``$GITHUB_STEP_SUMMARY``. Every string passes through
 
 Status vocabulary (per repository):
 
-``DISCOVERED``  found by discovery, not processed yet
-``ACCESSIBLE``  token preflight passed but no cleanup phase ran
-``DRY RUN``     analysed, nothing deleted
-``LIVE``        deletions executed
-``SKIPPED``     excluded (archived, read-only token, central-repository branch
-                exclusion, no access) — a reason is always recorded
-``FAILED``      an unexpected error occurred
+``DISCOVERED``        found by discovery, not processed yet
+``DRY_RUN_SUCCESS``   preview completed; nothing was deleted
+``LIVE_SUCCESS``      live execution completed without operation failures
+``PARTIAL_FAILURE``   some mutations succeeded but at least one operation failed
+``FAILED``            no successful mutation and at least one failure
+``SKIPPED``           deliberately not modified (archived, no write indicator,
+                      no access, or no enabled phase) — a reason is recorded
 """
 
 from __future__ import annotations
@@ -30,20 +30,24 @@ from tool.github_client import redact
 MAX_LISTED_ITEMS = 500
 
 STATUS_DISCOVERED = "DISCOVERED"
-STATUS_ACCESSIBLE = "ACCESSIBLE"
-STATUS_DRY_RUN = "DRY RUN"
-STATUS_LIVE = "LIVE"
+STATUS_DRY_RUN = "DRY_RUN_SUCCESS"
+STATUS_LIVE = "LIVE_SUCCESS"
+STATUS_PARTIAL = "PARTIAL_FAILURE"
 STATUS_SKIPPED = "SKIPPED"
 STATUS_FAILED = "FAILED"
+# Legacy label kept only so old imports do not crash; new code must not use it.
+STATUS_ACCESSIBLE = "ACCESSIBLE"
 
 ALL_STATUSES = (
     STATUS_DISCOVERED,
-    STATUS_ACCESSIBLE,
     STATUS_DRY_RUN,
     STATUS_LIVE,
+    STATUS_PARTIAL,
     STATUS_SKIPPED,
     STATUS_FAILED,
 )
+
+UNSUCCESSFUL_STATUSES = frozenset({STATUS_FAILED, STATUS_PARTIAL})
 
 
 def utc_now_iso() -> str:
@@ -76,14 +80,20 @@ class RepoReport:
     archived: bool = False
     fork: bool = False
     discovered_from: list[str] = field(default_factory=list)
+    discovery_status: str = "discovered"
     exclusion_reason: str = ""
 
     runs_examined: int = 0
+    runs_completed: int = 0
+    runs_active: int = 0
+    runs_unverifiable: int = 0
     runs_retained: int = 0
     runs_deleted: int = 0
+    runs_already_absent: int = 0
     runs_planned_deletions: int = 0
     runs_excluded: int = 0
     runs_failed: int = 0
+    runs_remaining: Optional[int] = None
 
     branches_examined: int = 0
     branches_kept: int = 0
@@ -98,6 +108,7 @@ class RepoReport:
     branch_decisions: list[BranchDecision] = field(default_factory=list)
     excluded_runs: list[dict] = field(default_factory=list)
     retention: dict = field(default_factory=dict)
+    verification: dict = field(default_factory=dict)
 
     @property
     def operation_failures(self) -> int:
@@ -105,7 +116,9 @@ class RepoReport:
 
     @property
     def failure_count(self) -> int:
-        return len(self.failures) + self.operation_failures
+        # Operation failures are already materialised as entries in
+        # ``failures``; counting them again here double-counted every bad run.
+        return len(self.failures)
 
     @property
     def live(self) -> bool:
@@ -113,9 +126,23 @@ class RepoReport:
 
     @property
     def can_write(self) -> bool:
+        return self._permission_ok("contents", "write")
+
+    @property
+    def actions_read(self) -> bool:
+        return self._permission_ok("actions", "read")
+
+    @property
+    def actions_write_status(self) -> str:
+        for check in self.permissions:
+            if check.get("scope") == "actions" and check.get("access") == "write":
+                return str(check.get("status") or "unverified")
+        return "unverified"
+
+    def _permission_ok(self, scope: str, access: str) -> bool:
         return any(
-            check.get("scope") == "contents"
-            and check.get("access") == "write"
+            check.get("scope") == scope
+            and check.get("access") == access
             and check.get("status") == "ok"
             for check in self.permissions
         )
@@ -132,9 +159,24 @@ class RepoReport:
     def skip(self, reason: str) -> None:
         """Mark the repository as skipped, keeping the reason explicit."""
         self.exclusion_reason = reason
-        if self.status != STATUS_FAILED:
+        if self.status not in UNSUCCESSFUL_STATUSES:
             self.status = STATUS_SKIPPED
         self.add_note(f"skipped: {reason}")
+
+    def finalise_status(self, *, live: bool, executed_any_phase: bool) -> None:
+        """Apply the required success/partial/failed/skipped vocabulary."""
+        if self.failures or self.operation_failures:
+            if self.runs_deleted or self.runs_already_absent or self.branches_deleted:
+                self.status = STATUS_PARTIAL
+            else:
+                self.status = STATUS_FAILED
+            return
+        if self.status == STATUS_SKIPPED:
+            return
+        if not executed_any_phase:
+            self.skip("no cleanup phase was enabled or permitted for this repository")
+            return
+        self.status = STATUS_LIVE if live else STATUS_DRY_RUN
 
     def as_dict(self) -> dict:
         return {
@@ -150,16 +192,24 @@ class RepoReport:
             "archived": self.archived,
             "fork": self.fork,
             "discovered_from": list(self.discovered_from),
+            "discovery_status": self.discovery_status,
             "exclusion_reason": self.exclusion_reason,
             "can_write": self.can_write,
+            "actions_read": self.actions_read,
+            "actions_write_status": self.actions_write_status,
             "failure_count": self.failure_count,
             "counts": {
                 "runs_examined": self.runs_examined,
+                "runs_completed": self.runs_completed,
+                "runs_active": self.runs_active,
+                "runs_unverifiable": self.runs_unverifiable,
                 "runs_retained": self.runs_retained,
                 "runs_deleted": self.runs_deleted,
+                "runs_already_absent": self.runs_already_absent,
                 "runs_planned_deletions": self.runs_planned_deletions,
                 "runs_excluded": self.runs_excluded,
                 "runs_failed": self.runs_failed,
+                "runs_remaining": self.runs_remaining,
                 "branches_examined": self.branches_examined,
                 "branches_kept": self.branches_kept,
                 "branches_deleted": self.branches_deleted,
@@ -173,6 +223,7 @@ class RepoReport:
             "branch_decisions": [decision.as_dict() for decision in self.branch_decisions],
             "excluded_runs": list(self.excluded_runs),
             "retention": dict(self.retention),
+            "verification": dict(self.verification),
         }
 
 
@@ -181,11 +232,15 @@ def aggregate(reports: Iterable[RepoReport]) -> dict:
     by_status = {status: 0 for status in ALL_STATUSES}
     for report in reports:
         by_status[report.status] = by_status.get(report.status, 0) + 1
+    failed = by_status.get(STATUS_FAILED, 0)
+    partial = by_status.get(STATUS_PARTIAL, 0)
     return {
         "repositories": len(reports),
         "by_status": by_status,
         "repositories_discovered": len(reports),
-        "repositories_failed": by_status.get(STATUS_FAILED, 0),
+        "repositories_failed": failed,
+        "repositories_partial": partial,
+        "repositories_unsuccessful": failed + partial,
         "repositories_skipped": by_status.get(STATUS_SKIPPED, 0),
         "repositories_dry_run": by_status.get(STATUS_DRY_RUN, 0),
         "repositories_live": by_status.get(STATUS_LIVE, 0),
@@ -193,8 +248,11 @@ def aggregate(reports: Iterable[RepoReport]) -> dict:
             1 for report in reports if report.status in (STATUS_DRY_RUN, STATUS_LIVE)
         ),
         "runs_examined": sum(r.runs_examined for r in reports),
+        "runs_completed": sum(r.runs_completed for r in reports),
+        "runs_active": sum(r.runs_active for r in reports),
         "runs_retained": sum(r.runs_retained for r in reports),
         "runs_deleted": sum(r.runs_deleted for r in reports),
+        "runs_already_absent": sum(r.runs_already_absent for r in reports),
         "runs_planned_deletions": sum(r.runs_planned_deletions for r in reports),
         "runs_excluded": sum(r.runs_excluded for r in reports),
         "runs_failed": sum(r.runs_failed for r in reports),
@@ -258,6 +316,19 @@ def render_discovery_table(discovery: Optional[dict]) -> list[str]:
     return lines
 
 
+def _runs_line(report: RepoReport) -> str:
+    remaining = "unknown" if report.runs_remaining is None else str(report.runs_remaining)
+    verification = report.verification.get("status") or "not_attempted"
+    return (
+        f"- Runs: examined {report.runs_examined}, completed {report.runs_completed}, "
+        f"active {report.runs_active}, unverifiable {report.runs_unverifiable}, "
+        f"retained {report.runs_retained}, planned deletions {report.runs_planned_deletions}, "
+        f"deleted {report.runs_deleted}, already absent {report.runs_already_absent}, "
+        f"excluded {report.runs_excluded}, failed {report.runs_failed}, "
+        f"remaining {remaining}, verification {verification}"
+    )
+
+
 def render_markdown(
     reports: list[RepoReport],
     *,
@@ -267,36 +338,35 @@ def render_markdown(
     discovery: Optional[dict] = None,
 ) -> str:
     lines = [
-        "# Central cleanup report",
+        f"# Central cleanup report — {mode.upper()}",
         "",
-        f"- Mode: **{mode.upper()}**",
-        f"- Generated at: `{generated_at}`",
-        f"- Repositories processed: **{totals['repositories']}** "
-        f"(dry run: {totals['repositories_dry_run']}, live: {totals['repositories_live']}, "
-        f"skipped: {totals['repositories_skipped']}, failed: {totals['repositories_failed']})",
+        f"- Generated: `{generated_at}`",
+        f"- Repositories: {totals['repositories']} "
+        f"(dry-run success: {totals['repositories_dry_run']}, live success: {totals['repositories_live']}, "
+        f"partial: {totals['repositories_partial']}, failed: {totals['repositories_failed']}, "
+        f"skipped: {totals['repositories_skipped']})",
         "",
     ]
     if discovery:
-        lines.insert(
-            5,
-            f"- Repositories discovered: **{discovery.get('count', 0)}**",
-        )
+        lines.insert(5, f"- Repositories discovered: **{discovery.get('count', 0)}**")
     lines += [
         "## Summary",
         "",
-        "| Repository | Status | Runs scanned | Runs retained | Runs deleted | Branches scanned "
-        "| Branches deleted | Failures |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Repository | Status | Runs scanned | Completed | Active | Retained | Deleted | Remaining | Verification | Failures |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for report in reports:
+        remaining = "unknown" if report.runs_remaining is None else str(report.runs_remaining)
+        verification = report.verification.get("status") or "not_attempted"
         lines.append(
-            f"| `{report.repository}` | {report.status} | {report.runs_examined} | {report.runs_retained} "
-            f"| {report.runs_deleted} | {report.branches_examined} | {report.branches_deleted} "
-            f"| {report.failure_count} |"
+            f"| `{report.repository}` | {report.status} | {report.runs_examined} "
+            f"| {report.runs_completed} | {report.runs_active} | {report.runs_retained} "
+            f"| {report.runs_deleted} | {remaining} | {verification} | {report.failure_count} |"
         )
     lines += [
-        f"| **Total** | | {totals['runs_examined']} | {totals['runs_retained']} | {totals['runs_deleted']} "
-        f"| {totals['branches_examined']} | {totals['branches_deleted']} | {totals['failures']} |",
+        f"| **Total** | | {totals['runs_examined']} | {totals['runs_completed']} "
+        f"| {totals['runs_active']} | {totals['runs_retained']} | {totals['runs_deleted']} "
+        f"| | | {totals['failures']} |",
         "",
     ]
     lines += render_discovery_table(discovery)
@@ -311,19 +381,23 @@ def render_markdown(
             + (", fork" if report.fork else "")
         )
         lines.append(f"- Default branch: `{report.default_branch or 'unknown'}`")
+        lines.append(f"- Discovery: {report.discovery_status} from {', '.join(report.discovered_from) or 'n/a'}")
         if report.exclusion_reason:
             lines.append(f"- Exclusion reason: {report.exclusion_reason}")
         lines.append(f"- Retention: newest {report.keep_latest} completed workflow runs")
         lines.append(
-            f"- Runs: examined {report.runs_examined}, retained {report.runs_retained}, "
-            f"planned deletions {report.runs_planned_deletions}, deleted {report.runs_deleted}, "
-            f"excluded {report.runs_excluded}, failed {report.runs_failed}"
+            f"- Permissions: contents write {'ok' if report.can_write else 'missing/unverified'}, "
+            f"actions read {'ok' if report.actions_read else 'missing'}, "
+            f"actions write {report.actions_write_status}"
         )
+        lines.append(_runs_line(report))
         lines.append(
             f"- Branches: examined {report.branches_examined}, kept {report.branches_kept}, "
             f"planned deletions {report.branches_planned_deletions}, deleted {report.branches_deleted}, "
             f"failed {report.branches_failed}"
         )
+        if report.verification:
+            lines.append(f"- Post-execution verification: `{json.dumps(report.verification, ensure_ascii=False)}`")
         if report.notes:
             lines.append("- Notes:")
             lines.extend(f"  - {note}" for note in report.notes)
@@ -355,17 +429,18 @@ def render_step_summary(
         "",
         f"Discovered: {discovery.get('count', 0) if discovery else 'n/a'} | "
         f"Processed: {totals['repositories']} | Failed: {totals['repositories_failed']} | "
-        f"Skipped: {totals['repositories_skipped']} | "
+        f"Partial: {totals['repositories_partial']} | Skipped: {totals['repositories_skipped']} | "
         f"Runs deleted: {totals['runs_deleted']} | Branches deleted: {totals['branches_deleted']}",
         "",
-        "| Repository | Status | Runs scanned | Retained | Deleted | Branches scanned | Deleted | Failures |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Repository | Status | Runs scanned | Retained | Deleted | Remaining | Verification | Failures |",
+        "|---|---|---:|---:|---:|---:|---|---:|",
     ]
     for report in reports:
+        remaining = "unknown" if report.runs_remaining is None else str(report.runs_remaining)
+        verification = report.verification.get("status") or "not_attempted"
         lines.append(
             f"| `{report.repository}` | {report.status} | {report.runs_examined} | {report.runs_retained} "
-            f"| {report.runs_deleted} | {report.branches_examined} | {report.branches_deleted} "
-            f"| {report.failure_count} |"
+            f"| {report.runs_deleted} | {remaining} | {verification} | {report.failure_count} |"
         )
     failing = [report for report in reports if report.failures]
     if failing:
@@ -408,13 +483,15 @@ class ReportWriter:
             f"- Mode: **{report.mode.upper()}**",
             f"- Started: `{report.started_at}`",
             f"- Finished: `{report.finished_at}`",
-            f"- Owner: {report.owner_login or 'unknown'} ({report.owner_type or 'unknown'})",
+            f"- Owner: `{report.owner_login or 'unknown'}` ({report.owner_type or 'unknown'})",
             f"- Visibility: {report.visibility or 'unknown'}"
             + (", archived" if report.archived else "")
             + (", fork" if report.fork else ""),
             f"- Discovered from: {', '.join(report.discovered_from) or 'n/a'}",
             f"- Default branch: `{report.default_branch or 'unknown'}`",
-            f"- Can write: {'yes' if report.can_write else 'no'}",
+            f"- Contents write: {'yes' if report.can_write else 'no'}",
+            f"- Actions read: {'yes' if report.actions_read else 'no'}",
+            f"- Actions write: {report.actions_write_status}",
         ]
         if report.exclusion_reason:
             markdown.append(f"- Exclusion reason: {report.exclusion_reason}")
@@ -423,11 +500,17 @@ class ReportWriter:
             "## Workflow runs",
             "",
             f"- Examined: {report.runs_examined}",
+            f"- Completed: {report.runs_completed}",
+            f"- Active: {report.runs_active}",
+            f"- Unverifiable: {report.runs_unverifiable}",
             f"- Retained (newest {report.keep_latest} completed): {report.runs_retained}",
             f"- Planned deletions: {report.runs_planned_deletions}",
             f"- Deleted: {report.runs_deleted}",
+            f"- Already absent (idempotent): {report.runs_already_absent}",
             f"- Excluded: {report.runs_excluded}",
             f"- Failed: {report.runs_failed}",
+            f"- Remaining: {'unknown' if report.runs_remaining is None else report.runs_remaining}",
+            f"- Verification: {report.verification.get('status') or 'not_attempted'}",
             "",
             "## Branches",
             "",

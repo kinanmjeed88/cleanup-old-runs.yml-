@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 # Pure logic — no I/O — testable
 
@@ -231,8 +232,11 @@ def gh_api(endpoint: str, method: str = "GET", **kwargs) -> Optional[dict]:
                 # For non-JSON responses (e.g., DELETE)
                 return {}
         stderr = proc.stderr.lower()
-        # Rate limit / transient errors
-        if any(code in stderr for code in ["429", "rate limit", "403", "secondary rate"]):
+        # Retry rate limits and transient server errors, never ordinary permission
+        # denials: a plain 403 is not made safer by repeating it.
+        if any(code in stderr for code in ["429", "rate limit", "secondary rate"]) or (
+            "403" in stderr and "rate" in stderr
+        ):
             wait = int(kwargs.get("retry_after", 2 ** attempt))
             print(f"::warning::GitHub API rate limited on {endpoint}, retry {attempt+1}/{max_retries} after {wait}s", file=sys.stderr)
             time.sleep(wait)
@@ -268,31 +272,30 @@ def fetch_default_branch(repo: str) -> Optional[str]:
     return None
 
 
-def list_remote_branches_api(repo: str) -> list[BranchInfo]:
+def list_remote_branches_api(repo: str) -> tuple[list[BranchInfo], bool]:
+    """Return (branches, complete).  A partial branch list is never safe."""
     branches: list[BranchInfo] = []
     page = 1
     while True:
         proc = run(["gh", "api", f"repos/{repo}/branches?per_page=100&page={page}", "--jq", ".[] | {name: .name, protected: .protected, sha: .commit.sha}"])
         if proc.returncode != 0:
             print(f"::warning::Failed to list branches page {page}: {proc.stderr}", file=sys.stderr)
-            break
-        # Parse line-delimited JSON
+            return branches, False
         lines = [l for l in proc.stdout.splitlines() if l.strip()]
         if not lines:
-            break
+            return branches, True
         for line in lines:
             try:
                 obj = json.loads(line)
                 branches.append(BranchInfo(name=obj["name"], sha=obj.get("sha"), protected=obj.get("protected", False)))
             except Exception:
-                continue
+                return branches, False
         if len(lines) < 100:
-            break
+            return branches, True
         page += 1
         if page > 50:
             print("::warning::Too many branch pages, stopping at 50", file=sys.stderr)
-            break
-    return branches
+            return branches, False
 
 
 def list_remote_branches_git_fallback() -> list[BranchInfo]:
@@ -308,23 +311,23 @@ def list_remote_branches_git_fallback() -> list[BranchInfo]:
     return branches
 
 
-def list_open_pr_branches(repo: str) -> set[str]:
+def list_open_pr_branches(repo: str) -> tuple[set[str], bool]:
+    """Return (open-pr refs, complete).  Missing an open PR could delete work."""
     refs: set[str] = set()
     page = 1
     while True:
         proc = run(["gh", "api", f"repos/{repo}/pulls?state=open&per_page=100&page={page}", "--jq", ".[].head.ref"])
         if proc.returncode != 0:
-            break
+            return refs, False
         lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
         if not lines:
-            break
+            return refs, True
         refs.update(lines)
         if len(lines) < 100:
-            break
+            return refs, True
         page += 1
         if page > 50:
-            break
-    return refs
+            return refs, False
 
 
 def list_closed_merged_prs(repo: str) -> dict[str, PRInfo]:
@@ -413,23 +416,52 @@ def merge_commit_is_ancestor(merge_sha: str, default_branch: str) -> Optional[bo
         return None
 
 
+def protection_status(repo: str, branch: str) -> str:
+    """Return ``protected``, ``unprotected`` or ``unknown``.
+
+    Only a conclusive HTTP 404 means unprotected.  403, 5xx, timeouts and any
+    other error are ``unknown`` and must keep the branch.
+    """
+    encoded = quote(branch, safe="/")
+    proc = run(["gh", "api", f"repos/{repo}/branches/{encoded}/protection"])
+    if proc.returncode == 0:
+        return "protected"
+    stderr = (proc.stderr or "").lower()
+    if "404" in stderr or "not found" in stderr:
+        return "unprotected"
+    return "unknown"
+
+
+def refresh_remote_refs(branch: str, default_branch: str) -> bool:
+    """Refresh the exact branch/default refs immediately before re-verification."""
+    encoded_branch = quote(branch, safe="/")
+    encoded_default = quote(default_branch, safe="/")
+    proc = run([
+        "git", "fetch", "origin",
+        f"+refs/heads/{encoded_branch}:refs/remotes/origin/{encoded_branch}",
+        f"+refs/heads/{encoded_default}:refs/remotes/origin/{encoded_default}",
+    ])
+    return proc.returncode == 0
+
+
 def delete_branch_remote(repo: str, branch: str, dry_run: bool = True) -> bool:
     if dry_run:
         print(f"[DRY RUN] Would delete branch: {branch}")
         return True
-    # Re-verify immediately before delete
-    print(f"Re-verifying branch {branch} before delete...")
-    # We re-check via API that PR is still not open and branch still exists
-    # Delete via gh api
-    proc = run(["gh", "api", "--method", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"])
+    print(f"Deleting branch {branch} through the scoped API...")
+    encoded = quote(branch, safe="/")
+    proc = run(["gh", "api", "--method", "DELETE", f"repos/{repo}/git/refs/heads/{encoded}"])
     if proc.returncode == 0:
         print(f"Deleted branch {branch}")
         return True
-    else:
-        # Never fall back to a Git push for deletion. A failed API request is
-        # inconclusive; keep the branch and require a fresh, explicit review.
-        print(f"::warning::Failed to delete {branch} through the scoped API: {proc.stderr}", file=sys.stderr)
-        return False
+    stderr = (proc.stderr or "").lower()
+    if "404" in stderr or "not found" in stderr:
+        print(f"Branch {branch} was already absent (HTTP 404); desired end state reached")
+        return True
+    # Never fall back to a Git push for deletion. A failed API request is
+    # inconclusive; keep the branch and require a fresh, explicit review.
+    print(f"::warning::Failed to delete {branch} through the scoped API: {proc.stderr}", file=sys.stderr)
+    return False
 
 
 def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tuple[int, int, int]:
@@ -476,10 +508,10 @@ def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tup
             if created >= cutoff_str:
                 skipped += 1
                 continue
-            print(f"Deleting run {run_id} | {created} | {name}")
             if dry_run:
-                deleted += 1
+                print(f"[DRY RUN] would delete run {run_id} | {created} | {name}")
                 continue
+            print(f"Deleting run {run_id} | {created} | {name}")
             del_proc = run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/runs/{run_id}"])
             if del_proc.returncode == 0:
                 deleted += 1
@@ -573,14 +605,26 @@ def main():
 
     # Branch cleanup
     if not args.skip_branches:
-        branches_api = list_remote_branches_api(repo)
+        branches_api, branches_complete = list_remote_branches_api(repo)
         if not branches_api:
             print("::warning::API listed 0 branches, trying git fallback", file=sys.stderr)
             branches_api = list_remote_branches_git_fallback()
+            branches_complete = bool(branches_api)
 
         protected_set = check_protected_branches(branches_api)
-        open_pr_set = list_open_pr_branches(repo)
+        open_pr_set, open_pr_complete = list_open_pr_branches(repo)
         merged_prs = list_closed_merged_prs(repo)
+
+        if not branches_complete or not open_pr_complete:
+            message = (
+                "branch safety listing is incomplete "
+                f"(branches_complete={branches_complete}, open_pr_complete={open_pr_complete}); "
+                "refusing branch deletions"
+            )
+            report["errors"].append(message)
+            print(f"::error::{message}", file=sys.stderr)
+            _write_json_report(args.json_report, report)
+            sys.exit(1)
 
         print(f"Found {len(branches_api)} remote branches")
         print(f"Protected: {protected_set}")
@@ -624,29 +668,43 @@ def main():
 
             # Re-verify protected before delete (defense in depth)
             if res.action == "delete":
-                # Final protected check via API (if 403, we keep)
-                prot_check = run(["gh", "api", f"repos/{repo}/branches/{branch.name}/protection"])
-                if prot_check.returncode == 0:
-                    # Protected — keep
+                # Only a conclusive 404 from the protection endpoint allows a
+                # deletion.  403, 5xx, timeouts and unknown errors keep safely.
+                prot = protection_status(repo, branch.name)
+                if prot == "protected":
                     res = EvalResult(branch.name, "keep", "protected (re-verified via API)", {"protected": True})
                     kept += 1
                     print(f"KEEP {branch.name}: {res.reason}")
                     results.append(res)
                     continue
-                elif "404" not in prot_check.stderr.lower():
-                    # If error is 403 (no access) we conservatively keep
-                    if "403" in prot_check.stderr or "resource not accessible" in prot_check.stderr.lower():
-                        res = EvalResult(branch.name, "keep", "cannot verify protection (403) — keep safely", {"api_403": True})
-                        kept += 1
-                        print(f"KEEP {branch.name}: {res.reason}")
-                        results.append(res)
-                        continue
+                if prot != "unprotected":
+                    res = EvalResult(branch.name, "keep", f"cannot verify protection ({prot}) — keep safely", {"protection_status": prot})
+                    kept += 1
+                    print(f"KEEP {branch.name}: {res.reason}")
+                    results.append(res)
+                    continue
 
-                # Attempt delete with re-verify of ancestor (in case branch moved)
-                # Re-check ancestor in case default moved
+                # Refresh the exact remote refs so the re-verification cannot
+                # act on a stale clone if the branch/default moved during scan.
+                if not refresh_remote_refs(branch.name, default_branch):
+                    res = EvalResult(branch.name, "keep", "cannot refresh remote refs before delete — keep safely", {"fetch_error": True})
+                    kept += 1
+                    print(f"KEEP {branch.name}: {res.reason}")
+                    results.append(res)
+                    continue
+
                 anc2 = is_ancestor(branch.name, default_branch)
-                if anc2 is not True and not (has_merged and merge_anc is True):
-                    res = EvalResult(branch.name, "keep", f"branch changed since evaluation (ancestor {anc} -> {anc2})", {"race": True})
+                diff2 = diff_empty(branch.name, default_branch)
+                merge_anc2 = None
+                if pr_info and pr_info.merge_commit_sha:
+                    merge_anc2 = merge_commit_is_ancestor(pr_info.merge_commit_sha, default_branch)
+                still_proven = (
+                    anc2 is True
+                    or (has_merged and merge_anc2 is True)
+                    or (has_merged and diff2 is True)
+                )
+                if diff2 is False or not still_proven:
+                    res = EvalResult(branch.name, "keep", f"branch changed since evaluation (ancestor {anc} -> {anc2}, diff {diff} -> {diff2})", {"race": True})
                     kept += 1
                     print(f"KEEP {branch.name}: {res.reason}")
                     results.append(res)
@@ -704,6 +762,8 @@ def main():
 
     _write_json_report(args.json_report, report)
     print("Cleanup finished.")
+    if report.get("errors") or report.get("failed"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

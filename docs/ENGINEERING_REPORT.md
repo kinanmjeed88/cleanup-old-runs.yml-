@@ -1,5 +1,10 @@
 # Engineering report — central multi-repository cleanup
 
+> **Historical report:** the 20-run figures below describe the original policy
+> and earlier test runs. Since the 2026-11-03 audit the default is **50 completed
+> runs per repository**. Current findings and results are in
+> [the Arabic audit](AUDIT_2026-11-03_AR.md).
+
 ## 1. How the system worked before the change
 
 | Area | Previous state |
@@ -107,18 +112,25 @@ during the scan → keep, deletion via API only.
 
 ## 6. Retention test results
 
-`tests/test_run_retention.py` — 30 tests, all passing. Covered:
+Retention is exercised both as pure-policy/unit tests and through the real
+workflow Bash → Python CLI → fake GitHub API path
+(`tests/test_workflow_execution.py`). The live matrix is:
 
-* 100 completed runs → keep 20, delete 80;
-* exactly 20 → delete 0; fewer than 20 → delete 0;
-* in-progress/queued/waiting/pending/requested runs never deleted;
-* current run never deleted and does not consume a retention slot;
-* >100 results → pagination (250 runs over 3 pages, all considered);
-* `total_count` mismatch, malformed entry, failed page → **no deletion**;
-* per-repository independence (75/32/8 → 55/12/0 deletions);
-* count-based, not age-based (30 runs older than a year still keep the newest 20);
-* dry run performs no DELETE call; live run deletes exactly the plan;
-* 403 on delete → repository aborted with a clear permission error.
+| Completed runs | Deleted | Remaining |
+|---|---|---|
+| 20 | 0 | 20 |
+| 50 | 0 | 50 |
+| 51 | 1 | 50 |
+| 100 | 50 | 50 |
+| 750 | 700 | 50 |
+| 1000 | 950 | 50 |
+
+Also covered: active/current runs never deleted; pagination across many pages;
+`total_count` drift/missing/duplicate ids/malformed entry/failed page → **no
+deletion**; oldest-first deletion; 404 already-absent; 422 continues;
+401/403/429/5xx/transport failure stops the repository; post-execution
+verification mismatch/incomplete listing fails the report; permission loss
+after partial success yields `PARTIAL_FAILURE` and exit `1`.
 
 ## 7. Branch test results
 
@@ -142,11 +154,14 @@ repositories** with the GitHub API replaced by an in-process router:
 
 * Token preflight per repository (read-only probes): `Metadata: Read`,
   `Contents: Read and write` (from the repository `permissions` object),
-  `Pull requests: Read`, `Actions: Read`. Missing capabilities skip that phase
-  and are reported per repository; they are never bypassed.
-* `Actions: write` cannot be probed without deleting: it is reported as
-  `unverified` and enforced at the first deletion — a 403 aborts that
-  repository with an explicit "Actions: Read and write" message.
+  `Pull requests: Read`, `Actions: Read`. Read and write capabilities are
+  reported separately; missing capabilities skip that phase and are reported
+  per repository, never bypassed.
+* `Actions: write` cannot be probed without deleting: it is always reported as
+  `unverified`. Live mutation additionally requires an observed repository write
+  indicator (for example `permissions.push`) as a conservative gate; a 403 at
+  deletion aborts that repository with an explicit "Actions: Read and write"
+  message. No trial deletion is performed.
 * The central workflow token is `contents: read` only; `actions: write` and
   `contents: write` were removed.
 * `tool/check_workflow_permissions.py` enforces 8 least-privilege rules
@@ -247,10 +262,13 @@ The orchestrator now starts every run with a discovery phase
 
 ## 12. Statuses
 
-`DISCOVERED` → `ACCESSIBLE` → `DRY RUN` / `LIVE`, plus `SKIPPED` and `FAILED`.
-`SKIPPED` always carries a reason (archived, read-only token, no access,
-branch phase excluded for the central repository). `FAILED` is used only for
-real failures; a skipped repository is not a failure and does not fail the run.
+`DISCOVERED` → `DRY_RUN_SUCCESS` / `LIVE_SUCCESS`, plus `PARTIAL_FAILURE`,
+`FAILED` and `SKIPPED`. `SKIPPED` always carries a reason (archived, no write
+indicator, no access, branch phase excluded for the central repository).
+`PARTIAL_FAILURE` means some deletions succeeded but a later operation or
+verification failed; `FAILED` means the repository could not be processed safely
+or every attempted operation failed. Both unsuccessful statuses exit `1`; a
+skipped repository is not a failure and does not fail the run.
 
 ## 13. Real discovery + dry run (2026-11-01)
 

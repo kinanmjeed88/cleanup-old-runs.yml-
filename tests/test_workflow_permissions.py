@@ -164,3 +164,28 @@ def test_pull_request_and_push_workflows_are_checked(repo_root: Path, trigger: s
     text = (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert trigger in text
     assert check_workflow_text(text, path="ci.yml") == []
+
+
+def test_workflow_actions_are_pinned_to_full_commit_shas():
+    import re
+
+    uses_re = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)(.*)$")
+    for name in ("ci.yml", "cleanup-old-runs.yml"):
+        path = Path(__file__).resolve().parents[1] / ".github/workflows" / name
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = uses_re.match(line)
+            if not match:
+                continue
+            ref, comment = match.groups()
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", ref), f"{name}: unpinned action {ref}"
+            assert re.search(r"#\s*v\d+", comment), f"{name}: pinned action missing version comment {ref}"
+
+
+def test_workflow_runners_are_pinned():
+    import yaml
+
+    for name in ("ci.yml", "cleanup-old-runs.yml"):
+        path = Path(__file__).resolve().parents[1] / ".github/workflows" / name
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for job in doc["jobs"].values():
+            assert job.get("runs-on") == "ubuntu-24.04", f"{name}: runner is not pinned"

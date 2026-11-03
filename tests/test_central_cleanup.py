@@ -28,7 +28,7 @@ def writer(tmp_path: Path) -> ReportWriter:
 
 
 def make_cleanup(client, tmp_path, *, options=None, branch_runner=None, workspace_factory=None, writer=None):
-    options = options or CleanupOptions(mode="dry-run", keep_latest=20)
+    options = options or CleanupOptions(mode="dry-run")
     return CentralCleanup(
         client=client,
         workspace_factory=workspace_factory
@@ -94,11 +94,11 @@ def test_dry_run_reports_without_deleting(tmp_path):
 
     report = cleanup.process("owner/repo")
 
-    assert report.status == "DRY RUN"
+    assert report.status == "DRY_RUN_SUCCESS"
     assert report.runs_examined == 75
-    assert report.runs_retained == 20
+    assert report.runs_retained == 50
     assert report.runs_deleted == 0
-    assert report.runs_planned_deletions == 55
+    assert report.runs_planned_deletions == 25
     assert client.delete_calls == []
 
 
@@ -110,9 +110,9 @@ def test_live_run_deletes_exactly_the_old_runs(tmp_path):
 
     report = cleanup.process("owner/repo")
 
-    assert report.status == "LIVE"
-    assert report.runs_deleted == 55
-    assert len(client.runs["owner/repo"]) == 20
+    assert report.status == "LIVE_SUCCESS"
+    assert report.runs_deleted == 25
+    assert len(client.runs["owner/repo"]) == 50
     assert client.delete_calls
 
 
@@ -152,13 +152,13 @@ def test_read_only_repository_is_analysed_but_never_mutated(tmp_path):
     assert client.delete_calls == []
     assert runner.calls == []  # no write access -> no clone, no branch phase
     assert report.status == "SKIPPED"
-    assert "read-only" in report.exclusion_reason
+    assert "no repository write indicator" in report.exclusion_reason
     assert any("Contents: Read and write" in note for note in report.notes)
 
 
 def test_read_only_repository_never_deletes_in_live_mode(tmp_path):
     client = FakeClient()
-    client.add_repository("owner/repo", runs=build_runs(30), can_push=False)
+    client.add_repository("owner/repo", runs=build_runs(60), can_push=False)
     cleanup = make_cleanup(client, tmp_path, options=CleanupOptions(mode="live"))
 
     report = cleanup.process("owner/repo")
@@ -202,7 +202,7 @@ def test_archived_repository_is_skipped(tmp_path):
 
 def test_central_repository_keeps_its_branches_but_cleans_runs(tmp_path):
     client = FakeClient()
-    client.add_repository("central/repo", runs=build_runs(25))
+    client.add_repository("central/repo", runs=build_runs(55))
     runner = FakeBranchRunner()
     options = CleanupOptions(mode="dry-run", central_repository="central/repo")
     cleanup = make_cleanup(client, tmp_path, options=options, branch_runner=runner)
@@ -212,7 +212,7 @@ def test_central_repository_keeps_its_branches_but_cleans_runs(tmp_path):
     assert report.runs_planned_deletions == 5  # runs are still cleaned
     assert runner.calls == []  # branches are not
     assert any("central repository" in note for note in report.notes)
-    assert report.status == "DRY RUN"
+    assert report.status == "DRY_RUN_SUCCESS"
 
 
 def test_incomplete_run_listing_deletes_nothing(tmp_path):
@@ -230,7 +230,7 @@ def test_incomplete_run_listing_deletes_nothing(tmp_path):
 
 def test_delete_permission_error_is_reported(tmp_path):
     client = FakeClient()
-    client.add_repository("owner/repo", runs=build_runs(30))
+    client.add_repository("owner/repo", runs=build_runs(60))
     client.forbid_delete.add("owner/repo")
     cleanup = make_cleanup(client, tmp_path, options=CleanupOptions(mode="live"))
 
@@ -268,19 +268,19 @@ def test_branch_runner_failure_is_recorded(tmp_path):
 
 def test_current_run_id_is_only_excluded_in_the_central_repository(tmp_path):
     client = FakeClient()
-    client.add_repository("central/repo", runs=build_runs(25, first_id=5000))
+    client.add_repository("central/repo", runs=build_runs(55, first_id=5000))
     options = CleanupOptions(
-        mode="live", keep_latest=20, central_repository="central/repo", current_run_id="5024"
+        mode="live", central_repository="central/repo", current_run_id="5024"
     )
     cleanup = make_cleanup(client, tmp_path, options=options)
 
     report = cleanup.process("central/repo")
 
     assert 5024 not in {run_id for _repo, run_id in client.delete_calls}
-    assert report.runs_deleted == 4  # 25 runs - current - 20 kept
+    assert report.runs_deleted == 4  # 55 runs - current - 50 kept
 
     other = FakeClient()
-    other.add_repository("other/repo", runs=build_runs(25, first_id=5000))
+    other.add_repository("other/repo", runs=build_runs(55, first_id=5000))
     cleanup_other = make_cleanup(other, tmp_path, options=options)
     cleanup_other.process("other/repo")
     # A run id that is not this repository's run is a normal candidate.
@@ -298,9 +298,9 @@ def test_one_failure_does_not_stop_other_repositories(tmp_path):
     reports = cleanup.run(["owner/good", "owner/bad", "owner/also-good"])
     statuses = {report.repository: report.status for report in reports}
 
-    assert statuses["owner/good"] == "DRY RUN"
+    assert statuses["owner/good"] == "DRY_RUN_SUCCESS"
     assert statuses["owner/bad"] == "FAILED"
-    assert statuses["owner/also-good"] == "DRY RUN"
+    assert statuses["owner/also-good"] == "DRY_RUN_SUCCESS"
     assert reports[0].runs_examined == 30
     assert reports[2].runs_examined == 10
 
@@ -308,7 +308,7 @@ def test_one_failure_does_not_stop_other_repositories(tmp_path):
 def test_reports_are_written_per_repository_and_aggregated(tmp_path):
     client = FakeClient()
     client.add_repository("owner/a", runs=build_runs(75, first_id=1000))
-    client.add_repository("owner/b", runs=build_runs(32, first_id=2000))
+    client.add_repository("owner/b", runs=build_runs(52, first_id=2000))
     client.add_repository("owner/c", runs=build_runs(8, first_id=3000))
     writer = ReportWriter(tmp_path / "diagnostics", mode="DRY RUN")
     cleanup = make_cleanup(client, tmp_path, writer=writer)
@@ -323,15 +323,15 @@ def test_reports_are_written_per_repository_and_aggregated(tmp_path):
     summary = json.loads((tmp_path / "diagnostics" / "summary.json").read_text(encoding="utf-8"))
     assert summary["mode"] == "DRY RUN"
     assert summary["totals"]["repositories"] == 3
-    assert summary["totals"]["runs_examined"] == 115
-    assert summary["totals"]["runs_retained"] == 48
-    assert summary["totals"]["runs_planned_deletions"] == 67
+    assert summary["totals"]["runs_examined"] == 135
+    assert summary["totals"]["runs_retained"] == 108
+    assert summary["totals"]["runs_planned_deletions"] == 27
     assert summary["totals"]["runs_deleted"] == 0
 
     per_repo = {
         item["repository"]: item["counts"]["runs_planned_deletions"] for item in summary["repositories"]
     }
-    assert per_repo == {"owner/a": 55, "owner/b": 12, "owner/c": 0}
+    assert per_repo == {"owner/a": 25, "owner/b": 2, "owner/c": 0}
 
 
 def test_unexpected_exception_is_isolated(tmp_path):
@@ -446,8 +446,8 @@ def test_cli_dry_run_end_to_end(config_root, monkeypatch):
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
 
     client = FakeClient()
-    client.add_repository("owner/a", runs=build_runs(25, first_id=1000))
-    client.add_repository("owner/b", runs=build_runs(40, first_id=2000))
+    client.add_repository("owner/a", runs=build_runs(55, first_id=1000))
+    client.add_repository("owner/b", runs=build_runs(70, first_id=2000))
     runner = FakeBranchRunner(
         decisions={
             "owner/a": [{"branch": "main", "action": "keep", "reason": "default branch"}],
@@ -499,8 +499,8 @@ def test_cli_live_runs_delete_only_when_confirmed(config_root, monkeypatch):
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
 
     client = FakeClient()
-    client.add_repository("owner/a", runs=build_runs(25))
-    client.add_repository("owner/b", runs=build_runs(30))
+    client.add_repository("owner/a", runs=build_runs(55))
+    client.add_repository("owner/b", runs=build_runs(60))
 
     monkeypatch.setattr(central_cleanup, "GhCliClient", lambda **kwargs: client)
     monkeypatch.setattr(
@@ -690,7 +690,7 @@ open(args.json_report, "w").write(json.dumps({
     report = cleanup.process("owner/repo")
 
     assert report.branches_examined == 1
-    assert report.status == "DRY RUN"
+    assert report.status == "DRY_RUN_SUCCESS"
     assert (reports_dir / "raw" / "owner__repo.branches.json").is_file()
 
 

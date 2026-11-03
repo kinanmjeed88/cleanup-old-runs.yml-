@@ -308,7 +308,7 @@ def test_cli_auto_mode_discovers_without_a_repository_list(root: Path, monkeypat
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
     client = FakeClient()
     client.authenticated_login = "acme"
-    client.add_repository("acme/a", runs=build_runs(25))
+    client.add_repository("acme/a", runs=build_runs(55))
     client.add_repository("acme/b", runs=build_runs(8))
     wire(monkeypatch, root, client)
 
@@ -334,7 +334,7 @@ def test_cli_processes_read_only_repositories_as_skipped(root: Path, monkeypatch
 
     summary = json.loads((root / "diagnostics" / "summary.json").read_text(encoding="utf-8"))
     statuses = {item["repository"]: item["status"] for item in summary["repositories"]}
-    assert statuses == {"acme/mine": "DRY RUN", "techtouchai/theirs": "SKIPPED"}
+    assert statuses == {"acme/mine": "DRY_RUN_SUCCESS", "techtouchai/theirs": "SKIPPED"}
     assert client.delete_calls == []
 
 
@@ -402,4 +402,4 @@ def test_cli_reports_a_failing_repository_and_continues(root: Path, monkeypatch)
     assert main(args_for(root)) == EXIT_FAILURES
     summary = json.loads((root / "diagnostics" / "summary.json").read_text(encoding="utf-8"))
     statuses = {item["repository"]: item["status"] for item in summary["repositories"]}
-    assert statuses == {"acme/a": "FAILED", "acme/b": "DRY RUN"}
+    assert statuses == {"acme/a": "FAILED", "acme/b": "DRY_RUN_SUCCESS"}

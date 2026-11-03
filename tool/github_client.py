@@ -28,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import quote_plus
 
 TOKEN_ENV_VAR = "CLEANUP_TOKEN"
 
@@ -49,6 +50,8 @@ _TOKEN_PATTERNS = (
 )
 
 _HTTP_STATUS_RE = re.compile(r"HTTP[ /](\d{3})", re.IGNORECASE)
+_RETRY_AFTER_RE = re.compile(r"retry-after:\s*(\d+)", re.IGNORECASE)
+MAX_RETRY_WAIT_SECONDS = 60
 
 
 class CleanupTokenError(RuntimeError):
@@ -77,6 +80,8 @@ def redact(text: Optional[str], token: Optional[str] = None) -> str:
             for encoded in (
                 base64.b64encode(f"x-access-token:{token}".encode()).decode(),
                 base64.b64encode(token.encode()).decode(),
+                quote_plus(token),
+                quote_plus(f"x-access-token:{token}"),
             ):
                 if encoded:
                     safe = safe.replace(encoded, REDACTED)
@@ -144,6 +149,10 @@ class ApiResult:
     def not_found(self) -> bool:
         return self.status == 404
 
+    @property
+    def transport_error(self) -> bool:
+        return not self.ok and self.status is None
+
 
 def _status_from_output(stderr: str) -> Optional[int]:
     match = _HTTP_STATUS_RE.search(stderr or "")
@@ -162,6 +171,16 @@ def _status_from_output(stderr: str) -> Optional[int]:
     if "unauthorized" in lowered or "bad credentials" in lowered:
         return 401
     return None
+
+
+def _retry_after_seconds(stderr: str) -> Optional[int]:
+    match = _RETRY_AFTER_RE.search(stderr or "")
+    if not match:
+        return None
+    try:
+        return max(0, int(match.group(1)))
+    except ValueError:  # pragma: no cover - defensive only
+        return None
 
 
 class GhCliClient:
@@ -217,14 +236,36 @@ class GhCliClient:
             raise GhUnavailableError(f"`gh` timed out after {timeout}s") from exc
 
     def api(self, endpoint: str, *, method: str = "GET") -> ApiResult:
-        """Call ``gh api ENDPOINT --method METHOD`` with rate-limit retries."""
+        """Call ``gh api ENDPOINT --method METHOD`` with bounded retries.
+
+        Retries are reserved for rate limits, transient server errors and API
+        timeouts.  Permission errors (401/403 without rate-limit wording), 404
+        and 422 are returned immediately.  ``Retry-After`` is honoured when the
+        CLI surfaces it; otherwise exponential backoff is capped.  A missing
+        ``gh`` executable is a configuration failure, not a retry loop.
+        """
         endpoint = endpoint.lstrip("/")
         cmd = ["gh", "api", endpoint, "--method", method]
         last_error = "unknown error"
         last_status: Optional[int] = None
 
         for attempt in range(self.max_retries + 1):
-            proc = self._runner(cmd, self.child_env(), self.timeout)
+            try:
+                proc = self._runner(cmd, self.child_env(), self.timeout)
+            except GhUnavailableError as exc:
+                last_status = None
+                last_error = redact(str(exc), self.token)
+                retriable = "timed out" in last_error.lower()
+                if retriable and attempt < self.max_retries:
+                    wait = min(2 ** attempt, 8)
+                    self._log(
+                        f"::warning::GitHub API transport timeout on {endpoint} "
+                        f"(attempt {attempt + 1}/{self.max_retries + 1}); retrying in {wait}s"
+                    )
+                    self._sleep(wait)
+                    continue
+                return ApiResult(False, None, None, last_error)
+
             stdout = getattr(proc, "stdout", "") or ""
             stderr = getattr(proc, "stderr", "") or ""
             if proc.returncode == 0:
@@ -243,6 +284,10 @@ class GhCliClient:
             )
             if retriable and attempt < self.max_retries:
                 wait = min(2 ** attempt, 8)
+                retry_after = _retry_after_seconds(stderr)
+                if retry_after is not None:
+                    wait = max(wait, retry_after)
+                wait = min(wait, MAX_RETRY_WAIT_SECONDS)
                 self._log(
                     f"::warning::GitHub API rate limited or unavailable on {endpoint} "
                     f"(attempt {attempt + 1}/{self.max_retries + 1}); retrying in {wait}s"
