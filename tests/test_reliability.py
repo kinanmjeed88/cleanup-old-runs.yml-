@@ -227,3 +227,16 @@ def test_verification_incomplete_listing_is_not_verified():
     record = verify_after_execution(client, "owner/repo", plan, RetentionOutcome())
     assert record["status"] == "incomplete"
     assert record["listing_complete"] is False
+
+
+def test_unverified_404_does_not_make_a_failed_repository_partial():
+    from tool.reports import RepoReport
+
+    report = RepoReport(repository="owner/repo", mode="LIVE")
+    report.runs_already_absent = 1
+    report.verification = {"status": "mismatch", "still_present_resolved_ids": [1000]}
+    report.add_failure("post-execution verification mismatch: run 1000 is still present")
+
+    report.finalise_status(live=True, executed_any_phase=True)
+
+    assert report.status == "FAILED"

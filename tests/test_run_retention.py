@@ -380,3 +380,14 @@ def test_configurable_retention_count(keep):
     plan = plan_retention(make_runs(80), repository="owner/repo", keep_latest=keep)
     assert len(plan.keep) == keep
     assert len(plan.delete) == 80 - keep
+
+
+def test_eighteen_completed_runs_are_all_retained_with_no_candidates():
+    runs = make_runs(18, first_id=300000)
+    plan = plan_retention(runs, repository="central/repo", keep_latest=50, current_run_id="999999")
+
+    assert plan.completed_count == 18
+    assert {run.id for run in plan.keep} == {run.id for run in runs}
+    assert plan.delete == []
+    assert plan.excluded == []
+    assert plan.aborted is False

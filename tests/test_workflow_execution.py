@@ -358,4 +358,131 @@ def test_manual_live_permission_loss_after_partial_success_is_partial_failure(tm
     assert repo["counts"]["runs_remaining"] == 57
     assert len(record["delete_calls"]) == 4
     assert "403" in repo["retention"]["stop_reason"]
+    assert repo["verification"]["expected_remaining"] == 57
+    assert repo["verification"]["failed_ids"] == [100003]
+    assert repo["verification"]["unattempted_ids"] == list(range(100004, 100010))
     assert "PARTIAL_FAILURE" in summary_path.read_text(encoding="utf-8")
+
+
+def test_workflow_central_repository_with_18_runs_retains_all_and_excludes_only_branches(tmp_path):
+    env, context, record_path, summary_path = _setup(
+        tmp_path,
+        "workflow_dispatch",
+        {"mode": "live", "confirm_live": "DELETE", "repository": CENTRAL, "skip_branches": False},
+    )
+    env["FAKE_CENTRAL_RUN_COUNT"] = "18"
+    assert _resolve_mode(tmp_path, env, context).returncode == 0
+    run = _run_cleanup(tmp_path, env, context)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    record = _record(record_path)
+    repo = _repo_summary(record, CENTRAL)
+    assert repo["status"] == "LIVE_SUCCESS"
+    assert repo["counts"]["runs_examined"] == 18
+    assert repo["counts"]["runs_completed"] == 18
+    assert repo["counts"]["runs_retained"] == 18
+    assert repo["counts"]["runs_planned_deletions"] == 0
+    assert repo["counts"]["runs_deleted"] == 0
+    assert repo["counts"]["runs_remaining"] == 18
+    assert repo["counts"]["branches_examined"] == 0
+    assert record["branch_calls"] == []
+    assert record["delete_calls"] == []
+    assert record["remaining_runs"][CENTRAL] == 18
+    assert any("branch cleanup excluded for the central repository" in note for note in repo["notes"])
+    assert any(
+        call["method"] == "GET" and call["endpoint"].startswith(f"repos/{CENTRAL}/actions/runs?")
+        for call in record["api_calls"]
+    )
+    reports_dir = Path(env["FAKE_REPORTS_DIR"])
+    markdown = (reports_dir / "reports" / f"{CENTRAL.replace('/', '__')}.md").read_text(encoding="utf-8")
+    assert "- Retained (newest 50 completed): 18" in markdown
+    assert "- Deleted: 0" in markdown
+    assert "- Remaining: 18" in markdown
+    assert "| 18 | 18 | 0 | 18 | not_attempted | 0 |" in summary_path.read_text(encoding="utf-8")
+
+
+def test_workflow_422_is_recorded_as_failure_and_processing_continues(tmp_path):
+    env, context, record_path, summary_path = _setup(
+        tmp_path,
+        "workflow_dispatch",
+        {"mode": "live", "confirm_live": "DELETE", "repository": TARGET, "skip_branches": True},
+    )
+    env["FAKE_RUN_COUNT"] = "53"
+    env["FAKE_DELETE_FAILURES"] = json.dumps({"100000": 422})
+    assert _resolve_mode(tmp_path, env, context).returncode == 0
+    run = _run_cleanup(tmp_path, env, context)
+
+    assert run.returncode == 1
+    record = _record(record_path)
+    repo = _repo_summary(record)
+    assert repo["status"] == "PARTIAL_FAILURE"
+    assert repo["counts"]["runs_deleted"] == 2
+    assert repo["counts"]["runs_failed"] == 1
+    assert repo["counts"]["runs_already_absent"] == 0
+    assert repo["counts"]["runs_remaining"] == 51
+    assert [run_id for _repo, run_id in record["delete_calls"]] == [100000, 100001, 100002]
+    assert sum(call["method"] == "DELETE" for call in record["api_calls"]) == 3  # no retry of 422
+    assert repo["verification"]["expected_remaining"] == 51
+    assert repo["verification"]["failed_ids"] == [100000]
+    assert repo["verification"]["still_present_failed_ids"] == [100000]
+    assert any("422" in failure for failure in repo["failures"])
+    reports_dir = Path(env["FAKE_REPORTS_DIR"])
+    markdown = (reports_dir / "reports" / f"{TARGET.replace('/', '__')}.md").read_text(encoding="utf-8")
+    assert "- Failed: 1" in markdown
+    assert "422" in markdown
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "PARTIAL_FAILURE" in summary
+    assert "422" in summary
+
+
+def test_workflow_delete_404_is_already_absent_not_deleted_and_is_verified(tmp_path):
+    env, context, record_path, _ = _setup(
+        tmp_path,
+        "workflow_dispatch",
+        {"mode": "live", "confirm_live": "DELETE", "repository": TARGET, "skip_branches": True},
+    )
+    env["FAKE_RUN_COUNT"] = "53"
+    env["FAKE_ABSENT_ON_DELETE"] = json.dumps([100000])
+    assert _resolve_mode(tmp_path, env, context).returncode == 0
+    run = _run_cleanup(tmp_path, env, context)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    record = _record(record_path)
+    repo = _repo_summary(record)
+    assert repo["status"] == "LIVE_SUCCESS"
+    assert repo["counts"]["runs_deleted"] == 2
+    assert repo["counts"]["runs_already_absent"] == 1
+    assert repo["counts"]["runs_failed"] == 0
+    assert repo["counts"]["runs_remaining"] == 50
+    assert repo["verification"]["status"] == "verified"
+    assert 100000 in repo["verification"]["resolved_ids"]
+    assert repo["verification"]["still_present_resolved_ids"] == []
+    assert len(record["delete_calls"]) == 3
+    reports_dir = Path(env["FAKE_REPORTS_DIR"])
+    markdown = (reports_dir / "reports" / f"{TARGET.replace('/', '__')}.md").read_text(encoding="utf-8")
+    assert "- Deleted: 2" in markdown
+    assert "- Already absent (idempotent): 1" in markdown
+
+
+def test_workflow_delete_404_without_actual_absence_fails_verification(tmp_path):
+    env, context, record_path, summary_path = _setup(
+        tmp_path,
+        "workflow_dispatch",
+        {"mode": "live", "confirm_live": "DELETE", "repository": TARGET, "skip_branches": True},
+    )
+    env["FAKE_RUN_COUNT"] = "51"
+    env["FAKE_404_WITHOUT_REMOVAL"] = json.dumps([100000])
+    assert _resolve_mode(tmp_path, env, context).returncode == 0
+    run = _run_cleanup(tmp_path, env, context)
+
+    assert run.returncode == 1
+    record = _record(record_path)
+    repo = _repo_summary(record)
+    assert repo["status"] == "FAILED"
+    assert repo["counts"]["runs_deleted"] == 0
+    assert repo["counts"]["runs_already_absent"] == 1
+    assert repo["counts"]["runs_remaining"] == 51
+    assert repo["verification"]["status"] == "mismatch"
+    assert repo["verification"]["still_present_resolved_ids"] == [100000]
+    assert any("verification mismatch" in failure for failure in repo["failures"])
+    assert "FAILED" in summary_path.read_text(encoding="utf-8")

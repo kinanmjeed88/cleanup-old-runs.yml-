@@ -64,9 +64,9 @@ set it to `true` when you only authorised workflow-run deletion.
 | default-branch guard | the cleanup job cannot run from a pull request or feature ref |
 | incomplete run listing | if any page fails, `total_count` changes or disagrees, ids duplicate, or an entry is unparsable, **nothing** is deleted for that repository |
 | deletion order | candidates are deleted oldest-first, so a mid-run stop leaves the newest runs intact |
-| already-deleted runs | HTTP 404 on a candidate is recorded as already absent, not as a failure |
-| stop-on-risk errors | HTTP 401/403/429/5xx or a transport failure stops that repository's deletions; 422 continues |
-| post-execution verification | after a live mutation the repository is re-listed; resolved ids must be gone and protected ids must remain, otherwise the report fails |
+| already-absent runs | a run-specific DELETE HTTP 404 is recorded as already absent, **not** as a deletion; the post-execution re-list must confirm absence |
+| stop-on-risk errors | HTTP 401/403/429/5xx or a transport failure stops that repository's deletions; HTTP 422 is recorded as a failure and processing continues with the remaining candidates |
+| post-execution verification | after live deletion attempts the repository is re-listed; resolved ids must be gone and protected ids must remain. Failed/unattempted candidates are expected survivors and are reported explicitly, otherwise the report fails |
 | conservative live gate | live mutation requires an observed repository write indicator; `Actions: Write` is reported as **unverified** until the API itself proves it |
 | active runs | queued / in progress / waiting / pending / requested runs are never deleted |
 | current run | the run executing the cleanup is always excluded |
@@ -110,6 +110,23 @@ Per-repository statuses: `DISCOVERED`, `DRY_RUN_SUCCESS`, `LIVE_SUCCESS`,
 `PARTIAL_FAILURE`, `FAILED`, `SKIPPED`. `PARTIAL_FAILURE` and `FAILED` make the
 process exit `1`; a dry run never mutates anything.
 
+### Counter meanings
+
+| Field | Meaning |
+|---|---|
+| `runs_retained` | Runs in the keep plan: normally the newest eligible completed runs. With a limit of 50, a repository that has only 18 completed runs retains **18**, not 0. On an aborted/incomplete listing this is the conservative keep-all set. |
+| `runs_planned_deletions` | Deletion candidates selected by the plan. For 18 completed runs and a limit of 50 this is **0**. |
+| `runs_deleted` | Successful DELETE responses only (HTTP 200/204). A dry run is always **0**. |
+| `runs_already_absent` | Run-specific DELETE 404 responses, counted separately from `runs_deleted` and checked again by verification. |
+| `runs_failed` | Failed DELETE attempts, including HTTP 422. Continuing after a 422 does not clear the failure. |
+| `runs_remaining` | In dry-run, the observed listing count (nothing was deleted). After live deletion attempts, the complete post-execution re-list count, or `unknown` if unavailable. |
+| `branches_examined = 0` | The branch phase did not inspect branches (for example `skip_branches=true` or the central-repository branch exclusion). It says nothing about run retention. |
+
+The central repository is excluded from **branch cleanup only**. Its workflow
+runs are still listed, planned and reported like any other repository. The
+shorthand `18/18/0/0` used in earlier summaries meant
+`examined/completed/candidates/deleted`; it never meant `retained=0`.
+
 ## Local usage
 
 ```bash
@@ -133,11 +150,13 @@ python3 tool/check_workflow_permissions.py .github/workflows
 python3 -m bandit -r tool -ll -q
 ```
 
-The test suite never touches the network and never deletes anything real:
-the GitHub API is replaced by in-memory fakes and the branch algorithm is
-exercised against local git repositories. `tests/test_workflow_execution.py`
-executes the workflow's Bash steps and the real Python CLI with a fake GitHub
-transport, including manual live deletion and a first-delete HTTP 403.
+Current suite: **252 tests**. The test suite never touches the network and never
+deletes anything real: the GitHub API is replaced by in-memory fakes and the
+branch algorithm is exercised against local git repositories.
+`tests/test_workflow_execution.py` executes the workflow's Bash steps and the
+real Python CLI with a fake GitHub transport, including manual live deletion,
+a first-delete HTTP 403, HTTP 422 continuation, verified/ambiguous HTTP 404, and
+the central-repository 18-run regression.
 
 See [`docs/CENTRAL_CLEANUP.md`](docs/CENTRAL_CLEANUP.md) for the architecture
 and [`docs/AUDIT_2026-11-03_AR.md`](docs/AUDIT_2026-11-03_AR.md) for the latest

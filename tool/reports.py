@@ -83,6 +83,11 @@ class RepoReport:
     discovery_status: str = "discovered"
     exclusion_reason: str = ""
 
+    # Counter contract (kept identical in JSON, Markdown and the step summary):
+    # retained = size of the keep plan, not a deletion count; deleted =
+    # successful DELETE responses only; already_absent = run-specific DELETE
+    # 404 responses, checked again by verification; remaining = observed count
+    # in dry-run, or the post-execution re-list count after live attempts.
     runs_examined: int = 0
     runs_completed: int = 0
     runs_active: int = 0
@@ -166,7 +171,14 @@ class RepoReport:
     def finalise_status(self, *, live: bool, executed_any_phase: bool) -> None:
         """Apply the required success/partial/failed/skipped vocabulary."""
         if self.failures or self.operation_failures:
-            if self.runs_deleted or self.runs_already_absent or self.branches_deleted:
+            # A DELETE 404 is only an idempotent success once the re-list has
+            # verified absence.  If verification failed/mismatched, it must not
+            # turn an otherwise failed repository into PARTIAL_FAILURE.
+            confirmed_already_absent = (
+                self.runs_already_absent > 0
+                and self.verification.get("status") == "verified"
+            )
+            if self.runs_deleted or self.branches_deleted or confirmed_already_absent:
                 self.status = STATUS_PARTIAL
             else:
                 self.status = STATUS_FAILED
@@ -316,6 +328,30 @@ def render_discovery_table(discovery: Optional[dict]) -> list[str]:
     return lines
 
 
+def _counter_definitions() -> list[str]:
+    """Shared legend so Markdown cannot drift from the JSON field meanings."""
+    return [
+        "",
+        "### Counter definitions",
+        "",
+        "- Retained (`runs_retained`): runs in the keep plan — normally the newest eligible "
+        "completed runs; on an aborted/incomplete listing this is the conservative keep-all set. "
+        "It is not a deletion count.",
+        "- Planned deletions (`runs_planned_deletions`): candidates selected by the retention plan.",
+        "- Deleted (`runs_deleted`): successful DELETE responses only (HTTP 200/204).",
+        "- Already absent (`runs_already_absent`): run-specific DELETE 404 responses, counted "
+        "separately from deleted and checked again by the post-execution re-list.",
+        "- Failed (`runs_failed`): failed DELETE attempts, including HTTP 422. Continuing after "
+        "a 422 never clears the failure.",
+        "- Remaining (`runs_remaining`): the observed listing count in dry-run (nothing was "
+        "deleted), or the complete post-execution re-list count after live deletion attempts; "
+        "`unknown` when no trustworthy count is available.",
+        "- Verification: checks that resolved ids are absent and protected ids remain. Failed "
+        "and unattempted candidates are expected survivors, not successes; operation failures "
+        "still make the repository PARTIAL_FAILURE or FAILED.",
+    ]
+
+
 def _runs_line(report: RepoReport) -> str:
     remaining = "unknown" if report.runs_remaining is None else str(report.runs_remaining)
     verification = report.verification.get("status") or "not_attempted"
@@ -369,6 +405,8 @@ def render_markdown(
         f"| | | {totals['failures']} |",
         "",
     ]
+    lines += _counter_definitions()
+    lines.append("")
     lines += render_discovery_table(discovery)
     lines += ["## Details", ""]
     for report in reports:
@@ -442,6 +480,7 @@ def render_step_summary(
             f"| `{report.repository}` | {report.status} | {report.runs_examined} | {report.runs_retained} "
             f"| {report.runs_deleted} | {remaining} | {verification} | {report.failure_count} |"
         )
+    lines += _counter_definitions()
     failing = [report for report in reports if report.failures]
     if failing:
         lines += ["", "### Failures", ""]
@@ -511,6 +550,9 @@ class ReportWriter:
             f"- Failed: {report.runs_failed}",
             f"- Remaining: {'unknown' if report.runs_remaining is None else report.runs_remaining}",
             f"- Verification: {report.verification.get('status') or 'not_attempted'}",
+        ]
+        markdown += _counter_definitions()
+        markdown += [
             "",
             "## Branches",
             "",

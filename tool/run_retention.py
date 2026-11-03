@@ -387,8 +387,23 @@ class RetentionOutcome:
 
     @property
     def resolved(self) -> list[int]:
-        """Ids whose desired end state (absent) is confirmed."""
+        """Ids reported absent by DELETE (204/200) or already absent (404).
+
+        This is an execution result, not independent proof: the post-execution
+        re-list must confirm that every resolved id is actually absent.
+        """
         return [*self.deleted, *self.already_absent]
+
+    @property
+    def failed_ids(self) -> list[int]:
+        """Ids whose DELETE attempt failed; these are never successes."""
+        return [run_id for run_id, _message in self.failed]
+
+    @property
+    def unattempted(self) -> list[int]:
+        """Planned ids not attempted after an early stop, in plan order."""
+        finished = set(self.resolved) | set(self.failed_ids)
+        return [run_id for run_id in self.planned if run_id not in finished]
 
 
 def apply_retention(
@@ -402,9 +417,12 @@ def apply_retention(
     """Execute (or simulate) the deletions of a plan.
 
     * 204/200 success increments ``deleted``.
-    * 404 increments ``already_absent`` (idempotent resume, not a failure).
+    * A run-specific DELETE 404 increments ``already_absent`` (idempotent
+      resume, not a deletion).  The later re-list must confirm absence; a 404
+      is not treated as proof that this process deleted the run.
     * 401/403/429/5xx/transport uncertainty stops the repository.
-    * 422 and other per-run client errors are recorded and the loop continues.
+    * 422 and other per-run client errors are recorded as failures and the loop
+      continues.  Continuing never converts a failed DELETE into a success.
     """
     emit = log or (lambda msg: print(msg))
     outcome = RetentionOutcome(planned=[run.id for run in plan.delete if run.id is not None])
@@ -455,16 +473,34 @@ def verify_after_execution(
 
     Returns a JSON-friendly verification record.  New runs created during the
     cleanup are reported but are not themselves a failure; missing protected
-    runs or still-present resolved ids are mismatches.
+    runs or still-present resolved ids are mismatches.  Failed and unattempted
+    candidates remain expected survivors and are reported explicitly, so a
+    partial execution is never described as though every candidate disappeared.
+    ``status=verified`` only means these end-state invariants were checked; the
+    repository can still be ``PARTIAL_FAILURE`` because of recorded failures.
     """
     listing = fetch_all_runs(client, repository)
+    resolved = set(outcome.resolved)
+    failed_ids = set(outcome.failed_ids)
+    unattempted_ids = set(outcome.unattempted)
+    protected = {run.id for run in plan.keep if run.id is not None}
+    protected.update(
+        item.run.id
+        for item in plan.excluded
+        if item.run.id is not None and item.reason != REASON_DUPLICATE
+    )
+    unresolved = failed_ids | unattempted_ids
     record: dict[str, Any] = {
         "status": "incomplete",
         "listing_complete": listing.complete,
         "remaining_total": len(listing.runs),
-        "expected_remaining": len(plan.keep) + len(plan.excluded),
+        "expected_remaining": len(protected | unresolved),
         "resolved_ids": list(outcome.resolved),
+        "failed_ids": sorted(failed_ids),
+        "unattempted_ids": sorted(unattempted_ids),
         "still_present_resolved_ids": [],
+        "still_present_failed_ids": [],
+        "still_present_unattempted_ids": [],
         "missing_protected_ids": [],
         "new_run_ids": [],
         "errors": list(listing.errors),
@@ -475,15 +511,10 @@ def verify_after_execution(
     present = {run.id for run in listing.runs if run.id is not None}
     original = {run.id for run in plan.keep + plan.delete if run.id is not None}
     original.update(item.run.id for item in plan.excluded if item.run.id is not None)
-    resolved = set(outcome.resolved)
-    protected = {run.id for run in plan.keep if run.id is not None}
-    protected.update(
-        item.run.id
-        for item in plan.excluded
-        if item.run.id is not None and item.reason != REASON_DUPLICATE
-    )
 
     record["still_present_resolved_ids"] = sorted(resolved & present)
+    record["still_present_failed_ids"] = sorted(failed_ids & present)
+    record["still_present_unattempted_ids"] = sorted(unattempted_ids & present)
     record["missing_protected_ids"] = sorted(protected - present)
     record["new_run_ids"] = sorted(present - original)
     if record["still_present_resolved_ids"] or record["missing_protected_ids"]:

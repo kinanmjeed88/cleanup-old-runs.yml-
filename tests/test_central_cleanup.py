@@ -705,3 +705,67 @@ def test_raw_report_directory_is_absolute(tmp_path: Path):
         log=lambda _m: None,
     )
     assert cleanup.raw_report_dir.is_absolute()
+
+
+@pytest.mark.parametrize("mode", ["dry-run", "live"])
+def test_central_repository_with_18_completed_runs_retains_all_and_only_excludes_branches(
+    tmp_path, monkeypatch, mode
+):
+    """Regression: 18 < 50 means retained=18, candidates=0, deleted=0.
+
+    The central branch exclusion must not disable run retention.  A second,
+    non-central repository proves the branch phase is still enabled globally.
+    JSON, aggregate Markdown and the step summary must agree with the plan.
+    """
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "step-summary.md"))
+    client = FakeClient()
+    client.add_repository("central/repo", runs=build_runs(18, first_id=300000))
+    client.add_repository("other/repo", runs=build_runs(60, first_id=400000))
+    runner = FakeBranchRunner()
+    options = CleanupOptions(
+        mode=mode,
+        central_repository="central/repo",
+        current_run_id="999999",  # the cleanup run is not among the 18 fake runs
+        run_runs=True,
+        run_branches=True,
+    )
+    cleanup = make_cleanup(client, tmp_path, options=options, branch_runner=runner)
+
+    reports = cleanup.run(["central/repo", "other/repo"])
+    central = reports[0]
+
+    assert central.status == ("DRY_RUN_SUCCESS" if mode == "dry-run" else "LIVE_SUCCESS")
+    assert central.runs_examined == 18
+    assert central.runs_completed == 18
+    assert central.runs_retained == 18
+    assert central.runs_planned_deletions == 0
+    assert central.runs_deleted == 0
+    assert central.runs_failed == 0
+    assert central.runs_remaining == 18
+    assert central.branches_examined == 0
+    assert any("branch cleanup excluded for the central repository" in note for note in central.notes)
+    assert ("central/repo", 1) in client.list_calls
+    assert [call["repository"] for call in runner.calls] == ["other/repo"]
+    assert all(repo != "central/repo" for repo, _run_id in client.delete_calls)
+    if mode == "live":
+        assert len(client.delete_calls) == 10  # other/repo still cleans runs
+        assert len(client.runs["central/repo"]) == 18
+
+    diagnostics = tmp_path / "diagnostics"
+    payload = json.loads((diagnostics / "reports" / "central__repo.json").read_text(encoding="utf-8"))
+    assert payload["keep_latest"] == 50
+    assert payload["counts"] == central.as_dict()["counts"]
+    assert payload["retention"]["runs_retained"] == 18
+    markdown = (diagnostics / "reports" / "central__repo.md").read_text(encoding="utf-8")
+    assert "- Retained (newest 50 completed): 18" in markdown
+    assert "- Planned deletions: 0" in markdown
+    assert "- Deleted: 0" in markdown
+    assert "- Remaining: 18" in markdown
+    assert "### Counter definitions" in markdown
+
+    summary = json.loads((diagnostics / "summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["runs_retained"] == 68  # central 18 + other 50
+    aggregate_md = (diagnostics / "REPORT.md").read_text(encoding="utf-8")
+    assert "| 18 | 18 | 0 | 18 | 0 | 18 | not_attempted | 0 |" in aggregate_md
+    step_summary = (tmp_path / "step-summary.md").read_text(encoding="utf-8")
+    assert f"| `central/repo` | {central.status} | 18 | 18 | 0 | 18 | not_attempted | 0 |" in step_summary

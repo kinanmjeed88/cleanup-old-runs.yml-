@@ -92,11 +92,41 @@ been printed and written to `diagnostics/summary.json`.
    (tie-break: run id descending). The newest `keep_latest` (default **50**) are
    retained; everything older is eligible for deletion, oldest-first.
 5. Ordering is computed **per repository**, never across repositories.
-6. Deletion stops on HTTP 401/403/429/5xx or transport failure; HTTP 404 is
-   recorded as already absent; HTTP 422 continues with the remaining candidates.
-7. After a live mutation the repository is re-listed. Every resolved id must be
-   absent and every protected id must still be present; new runs are tolerated.
-   Any mismatch or incomplete verification adds a report failure.
+6. Deletion response handling is explicit:
+
+   | Response | Executor behaviour | Report effect |
+   |---|---|---|
+   | 200/204 | Count as a successful DELETE | `runs_deleted += 1` |
+   | 404 on the run-specific DELETE | Do not retry; count as already absent, not deleted | `runs_already_absent += 1`; verification must confirm absence |
+   | 422 | Do not retry; record the failure and continue with later candidates | `runs_failed += 1`, failure text retained, unsuccessful status/exit `1` |
+   | 401/403/429/5xx or transport failure | Stop deletions for this repository | failure/stop reason retained, unsuccessful status/exit `1` |
+
+   A 404 on a *listing*, repository preflight or branch-protection endpoint is
+   not this idempotent-delete case; those paths keep their own fail-closed or
+   keep-on-doubt behaviour.
+7. After live deletion attempts the repository is re-listed. Every resolved id
+   must be absent and every protected id must still be present; new runs are
+   tolerated. Failed and unattempted candidates are included in
+   `expected_remaining` and listed explicitly, so a partial execution is not
+   described as though every candidate disappeared. Any mismatch or incomplete
+   verification adds a report failure. `verification=verified` only means the
+   end-state invariants were checked; the repository can still be
+   `PARTIAL_FAILURE` because of recorded operation failures.
+
+### Counter meanings and the central repository
+
+`runs_retained` is the size of the keep plan, not a deletion count. With the
+default limit of 50, a repository with 18 completed runs retains **18** and has
+**0** deletion candidates. `runs_deleted` counts only successful DELETE
+responses; `runs_already_absent` counts run-specific DELETE 404 responses;
+`runs_failed` counts failed DELETE attempts (including 422). In dry-run,
+`runs_remaining` is the observed listing count because nothing was deleted;
+after live deletion attempts it is the post-execution re-list count.
+
+The central-repository exclusion applies only to the branch phase. Run
+retention is executed before that exclusion is considered, so the central
+repository's runs are still listed, planned and reported. `branches_examined=0`
+therefore does not imply that run retention was skipped.
 
 ### Branch cleanup reuse
 
@@ -107,9 +137,11 @@ set to a temporary **full clone of the target repository** created by
 semantically identical to the original single-repository execution, while
 guaranteeing that central-repository refs can never be observed. The only change
 in that file is an additive `--json-report PATH` flag (plus its writer) so the
-orchestrator can report the reason for every branch decision. Branch and open-PR
-listings must be complete, remote refs are refreshed and the merge proof is
-re-verified immediately before any delete, and operation failures exit `1`.
+orchestrator can report the reason for every branch decision. The original
+merge-proof decision order is preserved. Branch and open-PR listings must be
+complete, remote refs are refreshed and the merge proof is re-verified
+immediately before any delete, refs are URL-encoded, and operation failures
+exit `1`.
 
 ### Token handling
 

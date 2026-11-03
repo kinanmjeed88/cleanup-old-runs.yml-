@@ -1,9 +1,11 @@
 # Engineering report — central multi-repository cleanup
 
-> **Historical report:** the 20-run figures below describe the original policy
-> and earlier test runs. Since the 2026-11-03 audit the default is **50 completed
-> runs per repository**. Current findings and results are in
-> [the Arabic audit](AUDIT_2026-11-03_AR.md).
+> **Mixed historical/current report:** sections describing the original
+> 20-run policy and earlier test totals are historical snapshots, not the
+> current suite size. Since the 2026-11-03 audit the default is **50 completed
+> runs per repository**. The current focused review is
+> [PR #4 final review (Arabic)](PR4_FINAL_REVIEW_AR.md); the current test count
+> is also stated in the README.
 
 ## 1. How the system worked before the change
 
@@ -38,7 +40,7 @@ properties.
 | `tool/reports.py` | new | per-repository + aggregate JSON/Markdown reports and job summary |
 | `tool/central_cleanup.py` | new | orchestrator: token preflight, per-repository phases, failure isolation, CLI safety gates |
 | `tool/check_workflow_permissions.py` | new | least-privilege linter for all workflows (8 rules) |
-| `tests/*` (8 files, 167 tests) | new | retention, branch algorithm, orchestration, config, token safety, workflow contract, simulated dry run |
+| `tests/*` | expanded | retention, branch algorithm, orchestration, config, token safety, workflow contract, simulated dry run, reliability and workflow execution |
 | `README.md`, `docs/CENTRAL_CLEANUP.md`, `requirements-dev.txt`, `pytest.ini`, `.gitignore` | new | usage, architecture, dev dependencies |
 
 ## 3. How the system now manages several repositories
@@ -134,9 +136,9 @@ after partial success yields `PARTIAL_FAILURE` and exit `1`.
 
 ## 7. Branch test results
 
-`tests/test_branch_algorithm.py` — 23 tests. 16 pure decision tests plus 7
-end-to-end tests that run `branch_cleanup.main()` against **real local git
-repositories** with the GitHub API replaced by an in-process router:
+`tests/test_branch_algorithm.py` combines pure decision tests with end-to-end
+tests that run `branch_cleanup.main()` against **real local git repositories**
+with the GitHub API replaced by an in-process router:
 
 * default branch, protected (flag and by name), open PR → keep;
 * real merge commit → delete;
@@ -181,12 +183,16 @@ repositories** with the GitHub API replaced by an in-process router:
 
 ## 9. GitHub Actions status
 
-* Commit `0ec5040` (full change set, PR #4) — **CI: success** on both the push
-  run (`41722325698`) and the pull-request run (`41722397954`). Job
-  `Tests, syntax and workflow permissions` ran every gate green: dependency
-  install, `compileall`, workflow least-privilege linter, Bandit security scan,
-  YAML syntax, the full pytest suite (243 tests), the workflow Bash-to-CLI
-  integration tests, the mocked dry-run simulation and the discovery tests.
+* Earlier hardening baseline: commit `0ec5040` (PR #4) passed CI on push run
+  `41722325698` and PR run `41722397954`. The focused final review adds the
+  central 18-run regression, explicit 404/422 workflow coverage and clearer
+  counter/verification reporting; the current suite size is **252 tests**.
+  For the latest pushed SHA, use the live checks on
+  [PR #4](https://github.com/kinanmjeed88/cleanup-old-runs.yml-/pull/4). Job
+  `Tests, syntax and workflow permissions` gates dependency install,
+  `compileall`, workflow least-privilege lint, Bandit (medium/high), YAML
+  syntax, the full pytest suite, workflow Bash-to-CLI integration, the mocked
+  dry-run simulation and discovery tests.
 * The `Central Cleanup` workflow is triggered by `schedule` and
   `workflow_dispatch`; both are confined to the default branch
   (`searchidf`) by the job guard, so it is intentionally *not* executed from
@@ -301,7 +307,7 @@ Executed with the development token against the real API:
 | `config/accounts.txt` | new: `kinanmjeed88`, `techtouchAI` |
 | `.github/workflows/cleanup-old-runs.yml` | `discovery_mode` / `discovery_only` inputs, `--accounts`, grand-total step, reports always uploaded |
 | `.github/workflows/ci.yml` | discovery test step |
-| `tests/test_discovery.py` | 25 new tests; suite is now 200 tests |
+| `tests/test_discovery.py` | discovery pagination, de-duplication and failure-mode tests (historical addendum; current suite size is in the README) |
 | `docs/DISCOVERY_REPORT_AR.md` | Arabic discovery + dry-run report |
 | `tool/branch_cleanup.py` | **untouched** in this addendum (decision order, merge proof, delete method unchanged) |
 

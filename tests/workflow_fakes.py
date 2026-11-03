@@ -71,11 +71,15 @@ class FakeGhTransport:
         else:
             raise AssertionError(f"unexpected fake API call: {method} {cmd[2]}")
 
+        # Model the real `gh` CLI: a run-specific 404 exits non-zero even when
+        # an abstract fake client chose to represent it as an idempotent result.
+        # The production GhCliClient must recover the status, not see a 204.
+        failed = (not result.ok) or result.status == 404
         return subprocess.CompletedProcess(
             cmd,
-            returncode=0 if result.ok else 1,
-            stdout=json.dumps(result.data) if result.ok and result.data is not None else "",
-            stderr="" if result.ok else (result.error or f"HTTP {result.status}"),
+            returncode=1 if failed else 0,
+            stdout="" if failed else (json.dumps(result.data) if result.data is not None else ""),
+            stderr=(result.error or f"HTTP {result.status}") if failed else "",
         )
 
 
@@ -92,14 +96,42 @@ def main() -> int:
     client = FakeClient()
     client.authenticated_login = "kinanmjeed88"
     run_count = int(os.environ.get("FAKE_RUN_COUNT", "739"))
+    central_run_count = int(os.environ.get("FAKE_CENTRAL_RUN_COUNT", "60"))
     client.add_repository(TARGET, runs=build_runs(run_count, first_id=100000))
-    client.add_repository(CENTRAL, runs=build_runs(60, first_id=300000))
+    client.add_repository(CENTRAL, runs=build_runs(central_run_count, first_id=300000))
     client.add_repository("techtouchAI/other", runs=build_runs(60, first_id=400000))
     if os.environ.get("FAKE_FIRST_DELETE_FORBIDDEN") == "true":
         client.forbid_delete.add(TARGET)
+
+    # Deterministic HTTP/concurrency injections.  All state is in memory; no
+    # request reaches GitHub.  Keys are run ids, values are HTTP statuses.
+    base_delete = client.delete_workflow_run
+    delete_failures = {
+        int(run_id): int(status)
+        for run_id, status in json.loads(os.environ.get("FAKE_DELETE_FAILURES", "{}")).items()
+    }
+    absent_on_delete = set(json.loads(os.environ.get("FAKE_ABSENT_ON_DELETE", "[]")))
+    absent_without_removal = set(json.loads(os.environ.get("FAKE_404_WITHOUT_REMOVAL", "[]")))
+    consumed_absent: set[int] = set()
+
+    def delete_with_injections(repo, run_id):
+        if run_id in absent_without_removal:
+            client.delete_calls.append((repo, run_id))
+            return ApiResult(False, 404, None, "gh: Not Found (HTTP 404)")
+        if run_id in absent_on_delete and run_id not in consumed_absent:
+            # Simulate another actor deleting the run between listing and DELETE.
+            client.runs[repo] = [run for run in client.runs.get(repo, []) if run["id"] != run_id]
+            consumed_absent.add(run_id)
+        status = delete_failures.get(run_id)
+        if status is not None:
+            client.delete_calls.append((repo, run_id))
+            return ApiResult(False, status, None, f"gh: injected deletion failure (HTTP {status})")
+        return base_delete(repo, run_id)
+
+    client.delete_workflow_run = delete_with_injections  # type: ignore[assignment]
     forbid_after = os.environ.get("FAKE_FORBID_DELETE_AFTER")
     if forbid_after is not None:
-        original_delete = client.delete_workflow_run
+        delete_before_permission_loss = client.delete_workflow_run
         remaining = {"n": int(forbid_after)}
 
         def lose_permission(repo, run_id):
@@ -107,7 +139,7 @@ def main() -> int:
                 client.delete_calls.append((repo, run_id))
                 return ApiResult(False, 403, None, "gh: Resource not accessible by integration (HTTP 403)")
             remaining["n"] -= 1
-            return original_delete(repo, run_id)
+            return delete_before_permission_loss(repo, run_id)
 
         client.delete_workflow_run = lose_permission  # type: ignore[assignment]
 
