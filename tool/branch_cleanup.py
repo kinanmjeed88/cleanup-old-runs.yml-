@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,6 +39,39 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+
+# Allow both `python3 tool/branch_cleanup.py` and `python3 -m tool.branch_cleanup`.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tool.github_client import redact
+
+DEFAULT_COMMAND_TIMEOUT = 60
+GIT_LIST_TIMEOUT = 120
+GIT_FETCH_TIMEOUT = 900
+MAX_BRANCH_PAGES = 50
+_HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})", re.IGNORECASE)
+_RETRY_AFTER_RE = re.compile(r"retry-after[:\s]+(\d+)", re.IGNORECASE)
+_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def _secret_token() -> str:
+    return os.environ.get("CLEANUP_TOKEN") or os.environ.get("GH_TOKEN") or ""
+
+
+def _redact(text: str) -> str:
+    return redact(text or "", _secret_token())
+
+
+def _http_status(stderr: str) -> Optional[int]:
+    match = _HTTP_STATUS_RE.search(stderr or "")
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
 
 # Pure logic — no I/O — testable
 
@@ -66,6 +100,44 @@ class EvalResult:
     action: str  # 'keep' or 'delete'
     reason: str
     details: dict = field(default_factory=dict)
+
+
+@dataclass
+class BranchListing:
+    """Structured result of branch discovery.
+
+    ``complete`` is only true when a source was read successfully to its end.
+    An empty list is not proof of an empty repository by itself; ``empty_verified``
+    records that a successful API listing and a successful ``git ls-remote`` both
+    agreed that no heads exist.
+    """
+
+    branches: list[BranchInfo] = field(default_factory=list)
+    complete: bool = False
+    source: str = "none"
+    empty_verified: bool = False
+    pages_read: int = 0
+    http_status: Optional[int] = None
+    returncode: Optional[int] = None
+    stderr: str = ""
+    error: str = ""
+    warnings: list[str] = field(default_factory=list)
+    attempts: list[dict] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "branch_count": len(self.branches),
+            "complete": self.complete,
+            "source": self.source,
+            "empty_verified": self.empty_verified,
+            "pages_read": self.pages_read,
+            "http_status": self.http_status,
+            "returncode": self.returncode,
+            "stderr": _redact(self.stderr)[:2000],
+            "error": _redact(self.error),
+            "warnings": [_redact(w) for w in self.warnings],
+            "attempts": list(self.attempts),
+        }
 
 
 def evaluate_branch(
@@ -217,7 +289,18 @@ def evaluate_all_branches(
 
 
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    """Run a child process with a bounded timeout and diagnostic-safe output.
+
+    A timeout or missing executable is returned as a non-zero CompletedProcess
+    so callers can record the failure instead of hanging or crashing.
+    """
+    timeout = kwargs.pop("timeout", DEFAULT_COMMAND_TIMEOUT)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"command timed out after {timeout}s")
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def gh_api(endpoint: str, method: str = "GET", **kwargs) -> Optional[dict]:
@@ -237,7 +320,9 @@ def gh_api(endpoint: str, method: str = "GET", **kwargs) -> Optional[dict]:
         if any(code in stderr for code in ["429", "rate limit", "secondary rate"]) or (
             "403" in stderr and "rate" in stderr
         ):
-            wait = int(kwargs.get("retry_after", 2 ** attempt))
+            retry_after = _RETRY_AFTER_RE.search(proc.stderr or "")
+            default_wait = int(retry_after.group(1)) if retry_after else 2 ** attempt
+            wait = int(kwargs.get("retry_after", default_wait))
             print(f"::warning::GitHub API rate limited on {endpoint}, retry {attempt+1}/{max_retries} after {wait}s", file=sys.stderr)
             time.sleep(wait)
             continue
@@ -246,7 +331,7 @@ def gh_api(endpoint: str, method: str = "GET", **kwargs) -> Optional[dict]:
         if attempt < max_retries - 1 and any(x in stderr for x in ["500", "502", "503", "504", "connection", "timed out"]):
             time.sleep(2 ** attempt)
             continue
-        print(f"::warning::gh api {endpoint} failed: {proc.stderr.strip()}", file=sys.stderr)
+        print(f"::warning::gh api {endpoint} failed: {_redact(proc.stderr.strip())}", file=sys.stderr)
         return None
     return None
 
@@ -272,43 +357,133 @@ def fetch_default_branch(repo: str) -> Optional[str]:
     return None
 
 
-def list_remote_branches_api(repo: str) -> tuple[list[BranchInfo], bool]:
-    """Return (branches, complete).  A partial branch list is never safe."""
-    branches: list[BranchInfo] = []
+def _list_remote_branches_api_detailed(repo: str) -> BranchListing:
+    """Paginate the branches API and keep completeness/diagnostic evidence."""
+    result = BranchListing(source="api")
+    seen: set[str] = set()
     page = 1
     while True:
         proc = run(["gh", "api", f"repos/{repo}/branches?per_page=100&page={page}", "--jq", ".[] | {name: .name, protected: .protected, sha: .commit.sha}"])
+        result.returncode = proc.returncode
+        result.stderr = (proc.stderr or "").strip()
+        result.pages_read = page
         if proc.returncode != 0:
-            print(f"::warning::Failed to list branches page {page}: {proc.stderr}", file=sys.stderr)
-            return branches, False
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+            result.http_status = _http_status(result.stderr)
+            result.error = f"API branch listing failed on page {page} (exit {proc.returncode})"
+            print(f"::warning::{_redact(result.error)}: {_redact(result.stderr)[:500]}", file=sys.stderr)
+            return result
+        result.http_status = 200
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
         if not lines:
-            return branches, True
+            result.complete = True
+            return result
         for line in lines:
             try:
                 obj = json.loads(line)
-                branches.append(BranchInfo(name=obj["name"], sha=obj.get("sha"), protected=obj.get("protected", False)))
-            except Exception:
-                return branches, False
+                name = obj["name"]
+                if not isinstance(name, str) or not name:
+                    raise ValueError("branch name missing")
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                result.error = f"invalid branch record on page {page}: {exc}"
+                print(f"::warning::{_redact(result.error)}", file=sys.stderr)
+                return result
+            if name in seen:
+                result.error = f"duplicate branch name in API pagination: {name}"
+                print(f"::warning::{_redact(result.error)}", file=sys.stderr)
+                return result
+            seen.add(name)
+            result.branches.append(BranchInfo(name=name, sha=obj.get("sha"), protected=bool(obj.get("protected", False))))
         if len(lines) < 100:
-            return branches, True
+            result.complete = True
+            return result
         page += 1
-        if page > 50:
-            print("::warning::Too many branch pages, stopping at 50", file=sys.stderr)
-            return branches, False
+        if page > MAX_BRANCH_PAGES:
+            result.error = f"branch pagination exceeded safety cap of {MAX_BRANCH_PAGES} pages"
+            print(f"::warning::{result.error}", file=sys.stderr)
+            return result
+
+
+def _list_remote_branches_git_detailed() -> BranchListing:
+    """Fallback/corroboration via ``git ls-remote --heads origin``.
+
+    The child exit code is authoritative: a zero exit with empty stdout proves
+    there are no heads; a non-zero exit (auth, network, missing remote, timeout)
+    never proves emptiness.
+    """
+    result = BranchListing(source="git")
+    proc = run(["git", "ls-remote", "--heads", "origin"], timeout=GIT_LIST_TIMEOUT)
+    result.returncode = proc.returncode
+    result.stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        result.error = f"git ls-remote failed (exit {proc.returncode})"
+        print(f"::warning::{_redact(result.error)}: {_redact(result.stderr)[:500]}", file=sys.stderr)
+        return result
+    seen: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) != 2 or not parts[1].startswith("refs/heads/"):
+            result.error = "unexpected git ls-remote output format"
+            return result
+        sha, ref = parts
+        name = ref.removeprefix("refs/heads/")
+        if not _SHA_RE.fullmatch(sha) or not name or name in seen:
+            result.error = f"invalid or duplicate git head record: {ref}"
+            return result
+        seen.add(name)
+        result.branches.append(BranchInfo(name=name, sha=sha))
+    result.complete = True
+    result.empty_verified = not result.branches
+    return result
+
+
+def discover_branches(repo: str) -> BranchListing:
+    """Resolve branch discovery with explicit empty-vs-failure semantics."""
+    api = _list_remote_branches_api_detailed(repo)
+    if api.complete and api.branches:
+        api.attempts = [api.as_dict()]
+        return api
+
+    git = _list_remote_branches_git_detailed()
+    api_attempt = api.as_dict()
+    git_attempt = git.as_dict()
+    if api.complete and not api.branches:
+        if git.complete and not git.branches:
+            api.source = "api+git"
+            api.empty_verified = True
+            api.warnings.append("empty branch list verified by API and git ls-remote")
+            api.attempts = [api_attempt, git_attempt]
+            return api
+        if git.complete and git.branches:
+            git.warnings.append("API listed zero branches but git ls-remote returned heads; using git")
+            git.attempts = [api_attempt, git_attempt]
+            return git
+        api.complete = False
+        api.error = "API returned an empty branch list but git ls-remote could not verify emptiness"
+        api.warnings.append(git.error or "git verification unavailable")
+        api.attempts = [api_attempt, git_attempt]
+        return api
+
+    if git.complete:
+        git.warnings.append(api.error or "API branch listing incomplete; using git ls-remote")
+        git.attempts = [api_attempt, git_attempt]
+        return git
+    api.warnings.append(git.error or "git ls-remote incomplete")
+    api.error = api.error or "branch listing incomplete"
+    api.attempts = [api_attempt, git_attempt]
+    return api
+
+
+def list_remote_branches_api(repo: str) -> tuple[list[BranchInfo], bool]:
+    """Backward-compatible tuple wrapper around the detailed API listing."""
+    listing = _list_remote_branches_api_detailed(repo)
+    return listing.branches, listing.complete
 
 
 def list_remote_branches_git_fallback() -> list[BranchInfo]:
-    proc = run(["git", "ls-remote", "--heads", "origin"])
-    branches: list[BranchInfo] = []
-    if proc.returncode == 0:
-        for line in proc.stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1].startswith("refs/heads/"):
-                name = parts[1].removeprefix("refs/heads/")
-                sha = parts[0]
-                branches.append(BranchInfo(name=name, sha=sha))
-    return branches
+    """Backward-compatible wrapper around the detailed git listing."""
+    return _list_remote_branches_git_detailed().branches
 
 
 def list_open_pr_branches(repo: str) -> tuple[set[str], bool]:
@@ -376,9 +551,9 @@ def check_protected_branches(branches: list[BranchInfo]) -> set[str]:
 
 def ensure_full_history():
     # Ensure we have full history for ancestor checks
-    run(["git", "fetch", "origin", "--prune", "--tags", "--prune-tags"], check=False)
+    run(["git", "fetch", "origin", "--prune", "--tags", "--prune-tags"], check=False, timeout=GIT_FETCH_TIMEOUT)
     # Fetch all heads to remotes/origin/*
-    run(["git", "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], check=False)
+    run(["git", "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], check=False, timeout=GIT_FETCH_TIMEOUT)
 
 
 def is_ancestor(branch: str, default_branch: str) -> Optional[bool]:
@@ -433,14 +608,16 @@ def protection_status(repo: str, branch: str) -> str:
 
 
 def refresh_remote_refs(branch: str, default_branch: str) -> bool:
-    """Refresh the exact branch/default refs immediately before re-verification."""
-    encoded_branch = quote(branch, safe="/")
-    encoded_default = quote(default_branch, safe="/")
+    """Refresh the exact branch/default refs immediately before re-verification.
+
+    Git refspecs take raw ref names; percent-encoding is only for API URL paths.
+    Encoding here would corrupt valid names containing ``%``, ``#`` or spaces.
+    """
     proc = run([
         "git", "fetch", "origin",
-        f"+refs/heads/{encoded_branch}:refs/remotes/origin/{encoded_branch}",
-        f"+refs/heads/{encoded_default}:refs/remotes/origin/{encoded_default}",
-    ])
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        f"+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}",
+    ], timeout=GIT_FETCH_TIMEOUT)
     return proc.returncode == 0
 
 
@@ -460,7 +637,7 @@ def delete_branch_remote(repo: str, branch: str, dry_run: bool = True) -> bool:
         return True
     # Never fall back to a Git push for deletion. A failed API request is
     # inconclusive; keep the branch and require a fresh, explicit review.
-    print(f"::warning::Failed to delete {branch} through the scoped API: {proc.stderr}", file=sys.stderr)
+    print(f"::warning::Failed to delete {branch} through the scoped API: {_redact(proc.stderr)}", file=sys.stderr)
     return False
 
 
@@ -486,7 +663,7 @@ def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tup
     while True:
         proc = run(["gh", "api", f"repos/{repo}/actions/runs?per_page=100&page={page}", "--jq", "[.workflow_runs[] | {id: .id, created_at: .created_at, status: .status, name: .name}]"])
         if proc.returncode != 0:
-            print(f"::warning::Failed to list runs page {page}: {proc.stderr}", file=sys.stderr)
+            print(f"::warning::Failed to list runs page {page}: {_redact(proc.stderr)}", file=sys.stderr)
             break
         try:
             runs = json.loads(proc.stdout) if proc.stdout.strip() else []
@@ -516,7 +693,7 @@ def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tup
             if del_proc.returncode == 0:
                 deleted += 1
             else:
-                print(f"::warning::Failed to delete run {run_id}: {del_proc.stderr}", file=sys.stderr)
+                print(f"::warning::Failed to delete run {run_id}: {_redact(del_proc.stderr)}", file=sys.stderr)
                 failed += 1
         if len(runs) < 100:
             break
@@ -577,6 +754,10 @@ def main():
         "failed": 0,
         "results": [],
         "errors": [],
+        "branches_complete": False,
+        "open_pr_complete": False,
+        "empty_verified": False,
+        "branch_listing": {},
     }
 
     # DRY_RUN env overrides: if DELETE_BRANCHES != true, stay dry
@@ -605,27 +786,35 @@ def main():
 
     # Branch cleanup
     if not args.skip_branches:
-        branches_api, branches_complete = list_remote_branches_api(repo)
-        if not branches_api:
-            print("::warning::API listed 0 branches, trying git fallback", file=sys.stderr)
-            branches_api = list_remote_branches_git_fallback()
-            branches_complete = bool(branches_api)
+        listing = discover_branches(repo)
+        branches_api = listing.branches
+        branches_complete = listing.complete
+        report["branch_listing"] = listing.as_dict()
+        report["branches_complete"] = branches_complete
+        report["empty_verified"] = listing.empty_verified
 
         protected_set = check_protected_branches(branches_api)
         open_pr_set, open_pr_complete = list_open_pr_branches(repo)
-        merged_prs = list_closed_merged_prs(repo)
+        report["open_pr_complete"] = open_pr_complete
+        merged_prs = list_closed_merged_prs(repo) if branches_api else {}
 
-        if not branches_complete or not open_pr_complete:
+        if not branches_complete or (branches_api and not open_pr_complete):
             message = (
                 "branch safety listing is incomplete "
                 f"(branches_complete={branches_complete}, open_pr_complete={open_pr_complete}); "
                 "refusing branch deletions"
             )
+            if listing.error:
+                message += f": {_redact(listing.error)}"
             report["errors"].append(message)
             print(f"::error::{message}", file=sys.stderr)
             _write_json_report(args.json_report, report)
             sys.exit(1)
 
+        if listing.empty_verified:
+            print("Verified empty repository: API and git ls-remote agree there are no branch heads")
+        if not branches_api and not open_pr_complete:
+            print("::warning::Open PR listing incomplete, but no branch heads exist to delete", file=sys.stderr)
         print(f"Found {len(branches_api)} remote branches")
         print(f"Protected: {protected_set}")
         print(f"Open PR branches: {open_pr_set}")

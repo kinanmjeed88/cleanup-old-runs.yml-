@@ -114,6 +114,7 @@ class RepoReport:
     excluded_runs: list[dict] = field(default_factory=list)
     retention: dict = field(default_factory=dict)
     verification: dict = field(default_factory=dict)
+    branch_listing: dict = field(default_factory=dict)
 
     @property
     def operation_failures(self) -> int:
@@ -236,6 +237,7 @@ class RepoReport:
             "excluded_runs": list(self.excluded_runs),
             "retention": dict(self.retention),
             "verification": dict(self.verification),
+            "branch_listing": dict(self.branch_listing),
         }
 
 
@@ -339,13 +341,15 @@ def _counter_definitions() -> list[str]:
         "It is not a deletion count.",
         "- Planned deletions (`runs_planned_deletions`): candidates selected by the retention plan.",
         "- Deleted (`runs_deleted`): successful DELETE responses only (HTTP 200/204).",
-        "- Already absent (`runs_already_absent`): run-specific DELETE 404 responses, counted "
-        "separately from deleted and checked again by the post-execution re-list.",
+        "- Already absent (`runs_already_absent`): run-specific DELETE 404 responses **only after** "
+        "a complete post-execution re-list confirms the run id is gone. Raw 404 responses are kept "
+        "separately as `retention.runs_delete_404` and are not counted as successes.",
         "- Failed (`runs_failed`): failed DELETE attempts, including HTTP 422. Continuing after "
         "a 422 never clears the failure.",
         "- Remaining (`runs_remaining`): the observed listing count in dry-run (nothing was "
         "deleted), or the complete post-execution re-list count after live deletion attempts; "
-        "`unknown` when no trustworthy count is available.",
+        "`unknown`/`null` when discovery or verification is incomplete, or a live execution "
+        "aborted before a trustworthy re-list.",
         "- Verification: checks that resolved ids are absent and protected ids remain. Failed "
         "and unattempted candidates are expected survivors, not successes; operation failures "
         "still make the repository PARTIAL_FAILURE or FAILED.",
@@ -562,6 +566,26 @@ class ReportWriter:
             f"- Deleted: {report.branches_deleted}",
             f"- Failed: {report.branches_failed}",
         ]
+        if report.branch_listing:
+            listing = report.branch_listing
+            markdown += [
+                "",
+                "### Branch listing diagnostics",
+                "",
+                f"- Source: `{listing.get('source', 'unknown')}`",
+                f"- Complete: {listing.get('complete')}",
+                f"- Empty verified: {listing.get('empty_verified')}",
+                f"- Branch count: {listing.get('branch_count')}",
+                f"- Pages read: {listing.get('pages_read')}",
+                f"- HTTP status: {listing.get('http_status')}",
+                f"- Exit code: {listing.get('returncode')}",
+            ]
+            if listing.get("error"):
+                markdown.append(f"- Error: {listing['error']}")
+            if listing.get("stderr"):
+                markdown.append(f"- stderr: `{listing['stderr']}`")
+            for warning in listing.get("warnings", []) or []:
+                markdown.append(f"- Warning: {warning}")
         if report.branch_decisions:
             markdown += ["", "### Branch decisions", "", "| Branch | Action | Reason |", "|---|---|---|"]
             for decision in report.branch_decisions[:MAX_LISTED_ITEMS]:

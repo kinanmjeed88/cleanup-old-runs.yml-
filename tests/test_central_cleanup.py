@@ -18,8 +18,9 @@ from tool.central_cleanup import (
     check_repository_access,
     main,
 )
+from tool.github_client import ApiResult
 from tool.git_workspace import WorkspaceError
-from tool.reports import ReportWriter
+from tool.reports import ReportWriter, RepoReport
 
 
 @pytest.fixture()
@@ -769,3 +770,107 @@ def test_central_repository_with_18_completed_runs_retains_all_and_only_excludes
     assert "| 18 | 18 | 0 | 18 | 0 | 18 | not_attempted | 0 |" in aggregate_md
     step_summary = (tmp_path / "step-summary.md").read_text(encoding="utf-8")
     assert f"| `central/repo` | {central.status} | 18 | 18 | 0 | 18 | not_attempted | 0 |" in step_summary
+
+
+def test_branch_listing_diagnostics_are_propagated(tmp_path):
+    client = FakeClient()
+    client.add_repository("owner/repo", runs=build_runs(3))
+    listing = {
+        "branch_count": 0,
+        "complete": True,
+        "source": "api+git",
+        "empty_verified": True,
+        "pages_read": 1,
+        "http_status": 200,
+        "returncode": 0,
+        "stderr": "",
+        "error": "",
+        "warnings": ["empty branch list verified by API and git ls-remote"],
+        "attempts": [],
+    }
+    runner = FakeBranchRunner(
+        report_override={
+            "repo": "owner/repo",
+            "dry_run": True,
+            "mode": "DRY RUN",
+            "default_branch": "main",
+            "branches_examined": 0,
+            "kept": 0,
+            "deleted": 0,
+            "planned_deletions": 0,
+            "failed": 0,
+            "results": [],
+            "errors": [],
+            "branches_complete": True,
+            "open_pr_complete": True,
+            "empty_verified": True,
+            "branch_listing": listing,
+        }
+    )
+    cleanup = make_cleanup(client, tmp_path, branch_runner=runner)
+
+    report = cleanup.process("owner/repo")
+
+    assert report.status == "DRY_RUN_SUCCESS"
+    assert report.branch_listing == listing
+    assert report.as_dict()["branch_listing"] == listing
+    assert any("verified empty" in note for note in report.notes)
+
+
+class VerificationFailsClient(FakeClient):
+    """Planning succeeds; the post-execution re-list fails after a delete."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.verification_phase = False
+
+    def delete_workflow_run(self, repo, run_id):
+        self.verification_phase = True
+        return super().delete_workflow_run(repo, run_id)
+
+    def list_workflow_runs(self, repo, page=1, per_page=100):
+        if self.verification_phase:
+            return ApiResult(False, 500, None, "gh: Server Error (HTTP 500)")
+        return super().list_workflow_runs(repo, page=page, per_page=per_page)
+
+
+def test_incomplete_verification_leaves_remaining_unknown(tmp_path):
+    client = VerificationFailsClient()
+    client.add_repository("owner/repo", runs=build_runs(51))
+    cleanup = make_cleanup(client, tmp_path, options=CleanupOptions(mode="live"))
+    cleanup.writer.mode = "LIVE"
+
+    report = cleanup.process("owner/repo")
+
+    assert report.runs_deleted == 1
+    assert report.runs_remaining is None
+    assert report.runs_already_absent == 0
+    assert report.verification["status"] == "incomplete"
+    assert report.verification["listing_complete"] is False
+    assert any("verification incomplete" in failure for failure in report.failures)
+    assert report.as_dict()["counts"]["runs_remaining"] is None
+
+
+def test_branch_listing_diagnostics_render_in_markdown(writer):
+    report = RepoReport(
+        repository="owner/repo",
+        mode="DRY RUN",
+        branch_listing={
+            "branch_count": 0,
+            "complete": True,
+            "source": "api+git",
+            "empty_verified": True,
+            "pages_read": 1,
+            "http_status": 200,
+            "returncode": 0,
+            "stderr": "",
+            "error": "",
+            "warnings": ["empty branch list verified by API and git ls-remote"],
+        },
+    )
+    paths = writer.write_repository(report)
+    markdown = paths["markdown"].read_text(encoding="utf-8")
+    assert "### Branch listing diagnostics" in markdown
+    assert "- Source: `api+git`" in markdown
+    assert "- Empty verified: True" in markdown
+    assert "- HTTP status: 200" in markdown

@@ -457,6 +457,9 @@ def test_workflow_delete_404_is_already_absent_not_deleted_and_is_verified(tmp_p
     assert repo["verification"]["status"] == "verified"
     assert 100000 in repo["verification"]["resolved_ids"]
     assert repo["verification"]["still_present_resolved_ids"] == []
+    assert repo["verification"]["verified_already_absent_ids"] == [100000]
+    assert repo["retention"]["runs_delete_404"] == 1
+    assert repo["retention"]["runs_already_absent"] == 1
     assert len(record["delete_calls"]) == 3
     reports_dir = Path(env["FAKE_REPORTS_DIR"])
     markdown = (reports_dir / "reports" / f"{TARGET.replace('/', '__')}.md").read_text(encoding="utf-8")
@@ -480,9 +483,13 @@ def test_workflow_delete_404_without_actual_absence_fails_verification(tmp_path)
     repo = _repo_summary(record)
     assert repo["status"] == "FAILED"
     assert repo["counts"]["runs_deleted"] == 0
-    assert repo["counts"]["runs_already_absent"] == 1
+    # A raw DELETE 404 is not an already-absent success while the run is still
+    # present in the complete re-list.
+    assert repo["counts"]["runs_already_absent"] == 0
+    assert repo["retention"]["runs_delete_404"] == 1
     assert repo["counts"]["runs_remaining"] == 51
     assert repo["verification"]["status"] == "mismatch"
     assert repo["verification"]["still_present_resolved_ids"] == [100000]
+    assert repo["verification"]["verified_already_absent_ids"] == []
     assert any("verification mismatch" in failure for failure in repo["failures"])
     assert "FAILED" in summary_path.read_text(encoding="utf-8")

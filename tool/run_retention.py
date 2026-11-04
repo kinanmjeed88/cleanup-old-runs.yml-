@@ -498,6 +498,8 @@ def verify_after_execution(
         "resolved_ids": list(outcome.resolved),
         "failed_ids": sorted(failed_ids),
         "unattempted_ids": sorted(unattempted_ids),
+        "raw_delete_404_ids": sorted(outcome.already_absent),
+        "verified_already_absent_ids": [],
         "still_present_resolved_ids": [],
         "still_present_failed_ids": [],
         "still_present_unattempted_ids": [],
@@ -512,6 +514,9 @@ def verify_after_execution(
     original = {run.id for run in plan.keep + plan.delete if run.id is not None}
     original.update(item.run.id for item in plan.excluded if item.run.id is not None)
 
+    # A DELETE 404 is only *already absent* once a complete re-list confirms the
+    # id is gone.  Until then it is an unverified raw 404, not a success counter.
+    record["verified_already_absent_ids"] = sorted(set(outcome.already_absent) - present)
     record["still_present_resolved_ids"] = sorted(resolved & present)
     record["still_present_failed_ids"] = sorted(failed_ids & present)
     record["still_present_unattempted_ids"] = sorted(unattempted_ids & present)
@@ -533,7 +538,10 @@ def summarise(plan: RetentionPlan, outcome: RetentionOutcome) -> dict:
         "runs_unverifiable": plan.unverifiable_count,
         "runs_retained": len(plan.keep),
         "runs_deleted": len(outcome.deleted),
-        "runs_already_absent": len(outcome.already_absent),
+        # Raw DELETE 404 responses are kept separately; the report-level
+        # ``runs_already_absent`` counter is populated only after verification.
+        "runs_delete_404": len(outcome.already_absent),
+        "runs_already_absent": 0,
         "runs_resolved": len(outcome.resolved),
         "runs_planned_deletions": len(outcome.planned),
         "runs_excluded": len(plan.excluded),
