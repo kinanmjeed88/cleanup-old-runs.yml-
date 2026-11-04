@@ -190,9 +190,10 @@ with the GitHub API replaced by an in-process router:
   For the latest pushed SHA, use the live checks on
   [PR #4](https://github.com/kinanmjeed88/cleanup-old-runs.yml-/pull/4). Job
   `Tests, syntax and workflow permissions` gates dependency install,
-  `compileall`, workflow least-privilege lint, Bandit (medium/high), YAML
-  syntax, the full pytest suite, workflow Bash-to-CLI integration, the mocked
-  dry-run simulation and discovery tests.
+  `compileall`, Ruff import/static lint (E9/F63/F7/F82/F401/F811/F821/F841),
+  workflow least-privilege lint, Bandit (medium/high), YAML syntax, the full
+  pytest suite, workflow Bash-to-CLI integration, the mocked dry-run simulation
+  and discovery tests.
 * The `Central Cleanup` workflow is triggered by `schedule` and
   `workflow_dispatch`; both are confined to the default branch
   (`searchidf`) by the job guard, so it is intentionally *not* executed from

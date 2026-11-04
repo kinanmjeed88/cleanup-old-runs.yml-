@@ -64,13 +64,14 @@ set it to `true` when you only authorised workflow-run deletion.
 | default-branch guard | the cleanup job cannot run from a pull request or feature ref |
 | incomplete run listing | if any page fails, `total_count` changes or disagrees, ids duplicate, or an entry is unparsable, **nothing** is deleted for that repository |
 | deletion order | candidates are deleted oldest-first, so a mid-run stop leaves the newest runs intact |
-| already-absent runs | a run-specific DELETE HTTP 404 is recorded as already absent, **not** as a deletion; the post-execution re-list must confirm absence |
+| already-absent runs | a run-specific DELETE HTTP 404 is only counted as already absent after a complete post-execution re-list confirms the id is gone; raw 404s are kept separately as `retention.runs_delete_404` |
 | stop-on-risk errors | HTTP 401/403/429/5xx or a transport failure stops that repository's deletions; HTTP 422 is recorded as a failure and processing continues with the remaining candidates |
 | post-execution verification | after live deletion attempts the repository is re-listed; resolved ids must be gone and protected ids must remain. Failed/unattempted candidates are expected survivors and are reported explicitly, otherwise the report fails |
 | conservative live gate | live mutation requires an observed repository write indicator; `Actions: Write` is reported as **unverified** until the API itself proves it |
 | active runs | queued / in progress / waiting / pending / requested runs are never deleted |
 | current run | the run executing the cleanup is always excluded |
 | branch deletion | unchanged `evaluate_branch` decision order; anything that cannot be *proved* merged is kept |
+| empty branch listing | an empty API page is not proof of an empty repository; `git ls-remote --heads` must also succeed with zero heads. If the two sources disagree or git fails, branch deletion is refused |
 | isolated git | each repository is cloned to its own temporary full clone; central refs are never visible |
 | failure isolation | one inaccessible or failing repository never stops the others |
 | discovery first | the discovered repository list is printed and written to `diagnostics/summary.json` before any repository is touched |
@@ -103,8 +104,9 @@ summary):
 
 * `summary.json` / `REPORT.md` — the discovery table plus an aggregate report;
 * `reports/<owner>__<repo>.json|.md` — per-repository report with counters,
-  token-preflight results, failures, verification state, remaining counts, and
-  the reason for every branch decision.
+  token-preflight results, failures, verification state, remaining counts,
+  branch-listing diagnostics (source, completeness, empty proof, HTTP/exit
+  codes, redacted stderr), and the reason for every branch decision.
 
 Per-repository statuses: `DISCOVERED`, `DRY_RUN_SUCCESS`, `LIVE_SUCCESS`,
 `PARTIAL_FAILURE`, `FAILED`, `SKIPPED`. `PARTIAL_FAILURE` and `FAILED` make the
@@ -117,10 +119,14 @@ process exit `1`; a dry run never mutates anything.
 | `runs_retained` | Runs in the keep plan: normally the newest eligible completed runs. With a limit of 50, a repository that has only 18 completed runs retains **18**, not 0. On an aborted/incomplete listing this is the conservative keep-all set. |
 | `runs_planned_deletions` | Deletion candidates selected by the plan. For 18 completed runs and a limit of 50 this is **0**. |
 | `runs_deleted` | Successful DELETE responses only (HTTP 200/204). A dry run is always **0**. |
-| `runs_already_absent` | Run-specific DELETE 404 responses, counted separately from `runs_deleted` and checked again by verification. |
+| `runs_already_absent` | Run-specific DELETE 404 responses **only after** a complete re-list confirms absence. Raw 404 responses are reported separately as `retention.runs_delete_404`. |
 | `runs_failed` | Failed DELETE attempts, including HTTP 422. Continuing after a 422 does not clear the failure. |
-| `runs_remaining` | In dry-run, the observed listing count (nothing was deleted). After live deletion attempts, the complete post-execution re-list count, or `unknown` if unavailable. |
+| `runs_remaining` | In dry-run, the observed listing count (nothing was deleted). After live deletion attempts, the complete post-execution re-list count, or `unknown`/`null` if discovery/verification is incomplete or a live execution aborted before a trustworthy re-list. |
 | `branches_examined = 0` | The branch phase did not inspect branches (for example `skip_branches=true` or the central-repository branch exclusion). It says nothing about run retention. |
+| `branches_deleted` | Successful branch DELETE responses only. A dry run is always **0**. |
+| `branches_already_absent` | Branch DELETE 404 responses **only after** an exact-ref `git ls-remote` re-list confirms the head is gone. Raw branch 404s are reported separately as `branches_delete_404`. |
+| `branches_planned_deletions` | Branches selected for deletion. In dry-run this is the plan size while `branches_deleted` remains **0**. |
+| `branch_open_pr.complete` | Whether the open-PR listing used for branch protection was complete. An incomplete listing refuses branch deletions. |
 
 The central repository is excluded from **branch cleanup only**. Its workflow
 runs are still listed, planned and reported like any other repository. The

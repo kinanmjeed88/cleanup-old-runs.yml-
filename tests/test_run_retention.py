@@ -391,3 +391,21 @@ def test_eighteen_completed_runs_are_all_retained_with_no_candidates():
     assert plan.delete == []
     assert plan.excluded == []
     assert plan.aborted is False
+
+
+@pytest.mark.parametrize("status", [501, 505, 599])
+def test_any_5xx_stops_repository_deletions(status):
+    client = FakeClient()
+    client.add_repository("owner/repo", runs=build_runs(55))
+    listing = fetch_all_runs(client, "owner/repo")
+    plan = plan_retention(listing.runs, repository="owner/repo", complete=listing.complete)
+
+    def fail(repo, run_id):
+        return ApiResult(False, status, None, f"gh: injected server error (HTTP {status})")
+
+    client.delete_workflow_run = fail  # type: ignore[assignment]
+    outcome = apply_retention(client, "owner/repo", plan, dry_run=False, log=lambda _m: None)
+    assert outcome.deleted == []
+    assert len(outcome.failed) == 1
+    assert outcome.stop_reason and f"HTTP {status}" in outcome.stop_reason
+    assert len(outcome.unattempted) == len(plan.delete) - 1

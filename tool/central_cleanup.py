@@ -559,7 +559,8 @@ class CentralCleanup:
         report.runs_unverifiable = plan.unverifiable_count
         report.runs_retained = len(plan.keep)
         report.runs_deleted = len(outcome.deleted)
-        report.runs_already_absent = len(outcome.already_absent)
+        # Unverified DELETE 404s are not counted as already-absent successes.
+        report.runs_already_absent = 0
         report.runs_planned_deletions = len(outcome.planned)
         report.runs_excluded = len(plan.excluded)
         report.runs_failed = len(outcome.failed)
@@ -569,7 +570,14 @@ class CentralCleanup:
         if not dry_run and outcome.planned and not plan.aborted:
             verification = verify_after_execution(self.client, repository, plan, outcome)
             report.verification = verification
-            report.runs_remaining = verification.get("remaining_total")
+            verified_absent = verification.get("verified_already_absent_ids", [])
+            report.runs_already_absent = len(verified_absent)
+            report.retention["runs_already_absent"] = len(verified_absent)
+            if verification.get("listing_complete"):
+                report.runs_remaining = verification.get("remaining_total")
+            else:
+                # A partial re-list cannot prove how many runs remain.
+                report.runs_remaining = None
             if verification.get("status") != "verified":
                 report.add_failure(
                     f"post-execution verification {verification.get('status')}: "
@@ -577,7 +585,12 @@ class CentralCleanup:
                 )
         else:
             report.verification = {"status": "not_attempted"}
-            report.runs_remaining = plan.examined - len(outcome.resolved)
+            if not listing.complete or (not dry_run and outcome.planned and plan.aborted):
+                # Incomplete discovery or an aborted live execution without a
+                # post-execution re-list leaves the remaining count unknown.
+                report.runs_remaining = None
+            else:
+                report.runs_remaining = plan.examined - len(outcome.resolved)
 
         for error in listing.errors:
             report.add_failure(error)
@@ -624,10 +637,21 @@ class CentralCleanup:
         report.branches_examined = int(payload.get("branches_examined") or 0)
         report.branches_kept = int(payload.get("kept") or 0)
         report.branches_deleted = int(payload.get("deleted") or 0)
+        report.branches_already_absent = int(payload.get("already_absent") or 0)
+        report.branches_delete_404 = int(payload.get("delete_404") or 0)
         report.branches_planned_deletions = int(payload.get("planned_deletions") or 0)
         report.branches_failed = int(payload.get("failed") or 0)
         if payload.get("default_branch"):
             report.default_branch = payload["default_branch"]
+        if isinstance(payload.get("branch_listing"), dict):
+            report.branch_listing = payload["branch_listing"]
+        if "open_pr_complete" in payload:
+            report.branch_open_pr_complete = bool(payload["open_pr_complete"])
+        report.branch_open_pr_count = int(
+            payload.get("open_pr_branch_count") or len(payload.get("open_pr_branches") or [])
+        )
+        if payload.get("empty_verified"):
+            report.add_note("branch listing verified empty (API and git ls-remote agree)")
         report.branch_decisions = [
             BranchDecision(
                 branch=str(item.get("branch", "")),
@@ -639,7 +663,11 @@ class CentralCleanup:
         ]
 
         if not result.ok:
-            report.add_failure(result.error or "branch cleanup failed")
+            detail = result.error or "branch cleanup failed"
+            listing_error = report.branch_listing.get("error") if report.branch_listing else ""
+            if listing_error and listing_error not in detail:
+                detail += f" (branch listing: {listing_error})"
+            report.add_failure(detail)
         for error in payload.get("errors", []) or []:
             report.add_failure(str(error))
         if report.branches_failed and not payload.get("errors"):
@@ -647,8 +675,8 @@ class CentralCleanup:
 
         self.log(
             f"Branches: examined={report.branches_examined} kept={report.branches_kept} "
-            f"deleted={report.branches_deleted} planned={report.branches_planned_deletions} "
-            f"failed={report.branches_failed}"
+            f"deleted={report.branches_deleted} already_absent={report.branches_already_absent} "
+            f"planned={report.branches_planned_deletions} failed={report.branches_failed}"
         )
 
     # -- all repositories --------------------------------------------------

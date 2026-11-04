@@ -50,8 +50,13 @@ REASON_UNVERIFIABLE_CREATED_AT = "unverifiable created_at"
 REASON_OLDER_THAN_RETENTION = "older than the newest {keep} completed runs"
 
 # HTTP failures that stop the remaining deletions for one repository.  404 is
-# deliberately absent: it is an idempotent "already gone" result, not a failure.
+# deliberately absent: it is a raw "already gone" response that still requires
+# post-execution verification.  Any 5xx is a stop, not just the common ones.
 STOP_DELETE_STATUSES = frozenset({401, 403, 429, 500, 502, 503, 504})
+
+
+def _stops_repository(status: Optional[int]) -> bool:
+    return status is None or status in STOP_DELETE_STATUSES or 500 <= status <= 599
 
 
 @dataclass(frozen=True)
@@ -417,9 +422,9 @@ def apply_retention(
     """Execute (or simulate) the deletions of a plan.
 
     * 204/200 success increments ``deleted``.
-    * A run-specific DELETE 404 increments ``already_absent`` (idempotent
-      resume, not a deletion).  The later re-list must confirm absence; a 404
-      is not treated as proof that this process deleted the run.
+    * A run-specific DELETE 404 is recorded as a raw 404 (not a deletion).
+      The later complete re-list must confirm absence before the report counts
+      it as ``already_absent``; a 404 alone is not proof.
     * 401/403/429/5xx/transport uncertainty stops the repository.
     * 422 and other per-run client errors are recorded as failures and the loop
       continues.  Continuing never converts a failed DELETE into a success.
@@ -449,7 +454,7 @@ def apply_retention(
             continue
 
         outcome.failed.append((run.id, f"delete failed (status {result.status}): {result.error}"))
-        if result.status in STOP_DELETE_STATUSES or result.status is None:
+        if _stops_repository(result.status):
             label = f"HTTP {result.status}" if result.status is not None else "transport failure"
             outcome.stop_reason = (
                 f"GitHub deletion stopped for run {run.id} ({label}). "
@@ -498,6 +503,8 @@ def verify_after_execution(
         "resolved_ids": list(outcome.resolved),
         "failed_ids": sorted(failed_ids),
         "unattempted_ids": sorted(unattempted_ids),
+        "raw_delete_404_ids": sorted(outcome.already_absent),
+        "verified_already_absent_ids": [],
         "still_present_resolved_ids": [],
         "still_present_failed_ids": [],
         "still_present_unattempted_ids": [],
@@ -512,6 +519,9 @@ def verify_after_execution(
     original = {run.id for run in plan.keep + plan.delete if run.id is not None}
     original.update(item.run.id for item in plan.excluded if item.run.id is not None)
 
+    # A DELETE 404 is only *already absent* once a complete re-list confirms the
+    # id is gone.  Until then it is an unverified raw 404, not a success counter.
+    record["verified_already_absent_ids"] = sorted(set(outcome.already_absent) - present)
     record["still_present_resolved_ids"] = sorted(resolved & present)
     record["still_present_failed_ids"] = sorted(failed_ids & present)
     record["still_present_unattempted_ids"] = sorted(unattempted_ids & present)
@@ -533,7 +543,10 @@ def summarise(plan: RetentionPlan, outcome: RetentionOutcome) -> dict:
         "runs_unverifiable": plan.unverifiable_count,
         "runs_retained": len(plan.keep),
         "runs_deleted": len(outcome.deleted),
-        "runs_already_absent": len(outcome.already_absent),
+        # Raw DELETE 404 responses are kept separately; the report-level
+        # ``runs_already_absent`` counter is populated only after verification.
+        "runs_delete_404": len(outcome.already_absent),
+        "runs_already_absent": 0,
         "runs_resolved": len(outcome.resolved),
         "runs_planned_deletions": len(outcome.planned),
         "runs_excluded": len(plan.excluded),

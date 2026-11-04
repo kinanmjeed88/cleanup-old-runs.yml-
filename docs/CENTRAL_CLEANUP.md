@@ -26,7 +26,7 @@ Python files.
 
 ```
 .github/workflows/cleanup-old-runs.yml   central entry point (schedule = dry-run, dispatch = dry-run|live)
-.github/workflows/ci.yml                 test + syntax + workflow-permission gates
+.github/workflows/ci.yml                 test + syntax + Ruff import lint + workflow-permission gates
 config/accounts.txt                      accounts to discover (one login per line)
 config/repositories.txt                  optional list, used only by discovery mode `list`/`union`
 tool/branch_cleanup.py                   branch deletion algorithm — UNCHANGED decision logic
@@ -97,7 +97,7 @@ been printed and written to `diagnostics/summary.json`.
    | Response | Executor behaviour | Report effect |
    |---|---|---|
    | 200/204 | Count as a successful DELETE | `runs_deleted += 1` |
-   | 404 on the run-specific DELETE | Do not retry; count as already absent, not deleted | `runs_already_absent += 1`; verification must confirm absence |
+   | 404 on the run-specific DELETE | Do not retry; record as a raw 404, not deleted | `retention.runs_delete_404 += 1`; `runs_already_absent` is incremented only if the complete re-list confirms absence |
    | 422 | Do not retry; record the failure and continue with later candidates | `runs_failed += 1`, failure text retained, unsuccessful status/exit `1` |
    | 401/403/429/5xx or transport failure | Stop deletions for this repository | failure/stop reason retained, unsuccessful status/exit `1` |
 
@@ -118,15 +118,28 @@ been printed and written to `diagnostics/summary.json`.
 `runs_retained` is the size of the keep plan, not a deletion count. With the
 default limit of 50, a repository with 18 completed runs retains **18** and has
 **0** deletion candidates. `runs_deleted` counts only successful DELETE
-responses; `runs_already_absent` counts run-specific DELETE 404 responses;
-`runs_failed` counts failed DELETE attempts (including 422). In dry-run,
-`runs_remaining` is the observed listing count because nothing was deleted;
-after live deletion attempts it is the post-execution re-list count.
+responses; `runs_already_absent` counts run-specific DELETE 404 responses only
+after a complete re-list confirms absence (raw 404s are kept as
+`retention.runs_delete_404`); `runs_failed` counts failed DELETE attempts
+(including 422). In dry-run, `runs_remaining` is the observed listing count
+because nothing was deleted; after live deletion attempts it is the complete
+post-execution re-list count, or `unknown`/`null` when discovery/verification is
+incomplete or a live execution aborted before a trustworthy re-list.
 
 The central-repository exclusion applies only to the branch phase. Run
 retention is executed before that exclusion is considered, so the central
 repository's runs are still listed, planned and reported. `branches_examined=0`
 therefore does not imply that run retention was skipped.
+
+Branch deletion uses the same raw-vs-verified distinction: a branch DELETE 404
+is recorded as `branches_delete_404` and only becomes `branches_already_absent`
+after an exact-ref `git ls-remote --heads origin refs/heads/<branch>` re-list
+confirms absence. If the re-list is incomplete or still shows the branch, the
+attempt is a failure, not an idempotent success. Dry-run branch reports keep
+`branches_deleted`, `branches_already_absent` and `branches_delete_404` at **0**
+and expose the plan through `branches_planned_deletions`. The report also
+carries `branch_open_pr.complete`; an incomplete open-PR listing refuses branch
+deletions.
 
 ### Branch cleanup reuse
 
@@ -135,13 +148,16 @@ set to a temporary **full clone of the target repository** created by
 `tool/git_workspace.py`. This keeps `git fetch origin`, `git merge-base
 --is-ancestor origin/<branch> origin/<default>` and `git diff origin/<default>...origin/<branch>`
 semantically identical to the original single-repository execution, while
-guaranteeing that central-repository refs can never be observed. The only change
-in that file is an additive `--json-report PATH` flag (plus its writer) so the
-orchestrator can report the reason for every branch decision. The original
-merge-proof decision order is preserved. Branch and open-PR listings must be
-complete, remote refs are refreshed and the merge proof is re-verified
-immediately before any delete, refs are URL-encoded, and operation failures
-exit `1`.
+guaranteeing that central-repository refs can never be observed. The original
+merge-proof decision order is preserved. Branch discovery now returns a
+structured `BranchListing` (source, completeness, pages, HTTP/exit codes,
+redacted stderr, per-attempt diagnostics). An empty API page is only accepted
+as an empty repository when `git ls-remote --heads origin` also succeeds with
+zero heads; otherwise branch deletion fails closed. Child commands have bounded
+timeouts. Branch and open-PR listings must be complete, remote refs are
+refreshed and the merge proof is re-verified immediately before any delete.
+API URL paths are percent-encoded, while git refspecs use raw ref names.
+Operation failures exit `1`.
 
 ### Token handling
 
