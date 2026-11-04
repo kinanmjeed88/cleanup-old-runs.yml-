@@ -404,7 +404,13 @@ class ApiRouter:
 
         if "/pulls?" in endpoint:
             if "state=open" in endpoint:
-                return proc(0, "\n".join(sorted(self.open_prs)))
+                return proc(
+                    0,
+                    "\n".join(
+                        json.dumps({"number": index, "head_ref": ref})
+                        for index, ref in enumerate(sorted(self.open_prs), start=1)
+                    ),
+                )
             lines = [
                 json.dumps(
                     {
@@ -616,6 +622,38 @@ def test_protection_check_500_keeps_the_branch(git_fixture, tmp_path, monkeypatc
     assert decisions["merged"]["action"] == "keep"
     assert "cannot verify protection" in decisions["merged"]["reason"]
     assert router.deletes == []
+
+
+def test_dry_run_plans_deletions_but_never_calls_delete(git_fixture, tmp_path, monkeypatch):
+    router = ApiRouter("owner/repo", branches=["main", "merged"])
+    report_path = tmp_path / "branch-report.json"
+    exit_code = run_main(
+        monkeypatch,
+        router,
+        ["--repo", "owner/repo", "--skip-runs", "--json-report", str(report_path)],
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert router.deletes == []
+    assert payload["deleted"] == 0
+    assert payload["already_absent"] == 0
+    assert payload["planned_deletions"] == 1
+
+
+def test_history_fetch_failure_refuses_branch_cleanup(git_fixture, tmp_path, monkeypatch):
+    router = ApiRouter("owner/repo", branches=["main", "merged"])
+    report_path = tmp_path / "branch-report.json"
+    monkeypatch.setattr(bc, "ensure_full_history", lambda: False)
+    exit_code = run_main(
+        monkeypatch,
+        router,
+        ["--repo", "owner/repo", "--skip-runs", "--json-report", str(report_path)],
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert router.deletes == []
+    assert payload["errors"]
+    assert "full git history" in payload["errors"][0]
 
 
 def test_incomplete_open_pr_listing_refuses_branch_deletion(git_fixture, tmp_path, monkeypatch):

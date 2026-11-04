@@ -103,18 +103,23 @@ class RepoReport:
     branches_examined: int = 0
     branches_kept: int = 0
     branches_deleted: int = 0
+    branches_already_absent: int = 0
+    branches_delete_404: int = 0
     branches_planned_deletions: int = 0
     branches_failed: int = 0
 
     keep_latest: int = 0
     permissions: list[dict] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    _failure_total: int = field(default=0, repr=False)
     notes: list[str] = field(default_factory=list)
     branch_decisions: list[BranchDecision] = field(default_factory=list)
     excluded_runs: list[dict] = field(default_factory=list)
     retention: dict = field(default_factory=dict)
     verification: dict = field(default_factory=dict)
     branch_listing: dict = field(default_factory=dict)
+    branch_open_pr_complete: Optional[bool] = None
+    branch_open_pr_count: int = 0
 
     @property
     def operation_failures(self) -> int:
@@ -124,7 +129,8 @@ class RepoReport:
     def failure_count(self) -> int:
         # Operation failures are already materialised as entries in
         # ``failures``; counting them again here double-counted every bad run.
-        return len(self.failures)
+        # The displayed list is capped, but the total must not be undercounted.
+        return max(self._failure_total, len(self.failures))
 
     @property
     def live(self) -> bool:
@@ -154,6 +160,7 @@ class RepoReport:
         )
 
     def add_failure(self, message: str) -> None:
+        self._failure_total += 1
         if len(self.failures) < MAX_LISTED_ITEMS:
             self.failures.append(message)
         self.status = STATUS_FAILED
@@ -179,7 +186,8 @@ class RepoReport:
                 self.runs_already_absent > 0
                 and self.verification.get("status") == "verified"
             )
-            if self.runs_deleted or self.branches_deleted or confirmed_already_absent:
+            confirmed_branch_absent = self.branches_already_absent > 0
+            if self.runs_deleted or self.branches_deleted or confirmed_already_absent or confirmed_branch_absent:
                 self.status = STATUS_PARTIAL
             else:
                 self.status = STATUS_FAILED
@@ -226,6 +234,8 @@ class RepoReport:
                 "branches_examined": self.branches_examined,
                 "branches_kept": self.branches_kept,
                 "branches_deleted": self.branches_deleted,
+                "branches_already_absent": self.branches_already_absent,
+                "branches_delete_404": self.branches_delete_404,
                 "branches_planned_deletions": self.branches_planned_deletions,
                 "branches_failed": self.branches_failed,
             },
@@ -238,6 +248,10 @@ class RepoReport:
             "retention": dict(self.retention),
             "verification": dict(self.verification),
             "branch_listing": dict(self.branch_listing),
+            "branch_open_pr": {
+                "complete": self.branch_open_pr_complete,
+                "branch_count": self.branch_open_pr_count,
+            },
         }
 
 
@@ -273,6 +287,8 @@ def aggregate(reports: Iterable[RepoReport]) -> dict:
         "branches_examined": sum(r.branches_examined for r in reports),
         "branches_kept": sum(r.branches_kept for r in reports),
         "branches_deleted": sum(r.branches_deleted for r in reports),
+        "branches_already_absent": sum(r.branches_already_absent for r in reports),
+        "branches_delete_404": sum(r.branches_delete_404 for r in reports),
         "branches_planned_deletions": sum(r.branches_planned_deletions for r in reports),
         "branches_failed": sum(r.branches_failed for r in reports),
         "failures": sum(r.failure_count for r in reports),
@@ -353,6 +369,9 @@ def _counter_definitions() -> list[str]:
         "- Verification: checks that resolved ids are absent and protected ids remain. Failed "
         "and unattempted candidates are expected survivors, not successes; operation failures "
         "still make the repository PARTIAL_FAILURE or FAILED.",
+        "- Branch already absent (`branches_already_absent`): branch DELETE 404 responses only "
+        "after an exact-ref `git ls-remote` re-list confirms the head is gone. Raw branch 404s "
+        "are kept separately as `branches_delete_404`.",
     ]
 
 
@@ -564,7 +583,10 @@ class ReportWriter:
             f"- Kept: {report.branches_kept}",
             f"- Planned deletions: {report.branches_planned_deletions}",
             f"- Deleted: {report.branches_deleted}",
+            f"- Already absent (verified): {report.branches_already_absent}",
+            f"- Raw DELETE 404: {report.branches_delete_404}",
             f"- Failed: {report.branches_failed}",
+            f"- Open PR listing complete: {report.branch_open_pr_complete}",
         ]
         if report.branch_listing:
             listing = report.branch_listing

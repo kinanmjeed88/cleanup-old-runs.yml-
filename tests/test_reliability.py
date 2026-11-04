@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import subprocess
 
-import pytest
-
 from tests.fakes import FakeClient, build_runs
 from tool.github_client import ApiResult, GhCliClient, GhUnavailableError
 from tool.run_retention import (

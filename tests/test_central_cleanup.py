@@ -874,3 +874,69 @@ def test_branch_listing_diagnostics_render_in_markdown(writer):
     assert "- Source: `api+git`" in markdown
     assert "- Empty verified: True" in markdown
     assert "- HTTP status: 200" in markdown
+
+
+def test_branch_already_absent_counters_are_propagated(tmp_path):
+    client = FakeClient()
+    client.add_repository("owner/repo", runs=build_runs(3))
+    runner = FakeBranchRunner(
+        report_override={
+            "repo": "owner/repo",
+            "dry_run": False,
+            "mode": "LIVE",
+            "default_branch": "main",
+            "branches_examined": 2,
+            "kept": 0,
+            "deleted": 1,
+            "already_absent": 1,
+            "delete_404": 1,
+            "planned_deletions": 2,
+            "failed": 0,
+            "results": [],
+            "errors": [],
+        }
+    )
+    cleanup = make_cleanup(client, tmp_path, options=CleanupOptions(mode="live"), branch_runner=runner)
+    cleanup.writer.mode = "LIVE"
+    report = cleanup.process("owner/repo")
+    assert report.branches_deleted == 1
+    assert report.branches_already_absent == 1
+    assert report.branches_delete_404 == 1
+    assert report.as_dict()["counts"]["branches_already_absent"] == 1
+
+
+def test_failure_count_is_not_undercounted_when_list_is_capped():
+    from tool.reports import MAX_LISTED_ITEMS
+
+    report = RepoReport(repository="owner/repo", mode="LIVE")
+    for index in range(MAX_LISTED_ITEMS + 25):
+        report.add_failure(f"failure {index}")
+    assert len(report.failures) == MAX_LISTED_ITEMS
+    assert report.failure_count == MAX_LISTED_ITEMS + 25
+
+
+def test_open_pr_completeness_is_propagated(tmp_path):
+    client = FakeClient()
+    client.add_repository("owner/repo", runs=build_runs(3))
+    runner = FakeBranchRunner(
+        report_override={
+            "repo": "owner/repo",
+            "dry_run": True,
+            "mode": "DRY RUN",
+            "default_branch": "main",
+            "branches_examined": 1,
+            "kept": 1,
+            "deleted": 0,
+            "planned_deletions": 0,
+            "failed": 0,
+            "open_pr_complete": True,
+            "open_pr_branch_count": 2,
+            "results": [],
+            "errors": [],
+        }
+    )
+    cleanup = make_cleanup(client, tmp_path, branch_runner=runner)
+    report = cleanup.process("owner/repo")
+    assert report.branch_open_pr_complete is True
+    assert report.branch_open_pr_count == 2
+    assert report.as_dict()["branch_open_pr"] == {"complete": True, "branch_count": 2}

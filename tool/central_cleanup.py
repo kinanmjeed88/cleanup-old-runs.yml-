@@ -637,12 +637,19 @@ class CentralCleanup:
         report.branches_examined = int(payload.get("branches_examined") or 0)
         report.branches_kept = int(payload.get("kept") or 0)
         report.branches_deleted = int(payload.get("deleted") or 0)
+        report.branches_already_absent = int(payload.get("already_absent") or 0)
+        report.branches_delete_404 = int(payload.get("delete_404") or 0)
         report.branches_planned_deletions = int(payload.get("planned_deletions") or 0)
         report.branches_failed = int(payload.get("failed") or 0)
         if payload.get("default_branch"):
             report.default_branch = payload["default_branch"]
         if isinstance(payload.get("branch_listing"), dict):
             report.branch_listing = payload["branch_listing"]
+        if "open_pr_complete" in payload:
+            report.branch_open_pr_complete = bool(payload["open_pr_complete"])
+        report.branch_open_pr_count = int(
+            payload.get("open_pr_branch_count") or len(payload.get("open_pr_branches") or [])
+        )
         if payload.get("empty_verified"):
             report.add_note("branch listing verified empty (API and git ls-remote agree)")
         report.branch_decisions = [
@@ -668,8 +675,8 @@ class CentralCleanup:
 
         self.log(
             f"Branches: examined={report.branches_examined} kept={report.branches_kept} "
-            f"deleted={report.branches_deleted} planned={report.branches_planned_deletions} "
-            f"failed={report.branches_failed}"
+            f"deleted={report.branches_deleted} already_absent={report.branches_already_absent} "
+            f"planned={report.branches_planned_deletions} failed={report.branches_failed}"
         )
 
     # -- all repositories --------------------------------------------------

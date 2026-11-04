@@ -279,8 +279,10 @@ class GhCliClient:
             last_status = _status_from_output(stderr)
             last_error = redact(stderr.strip() or stdout.strip() or f"gh api exited {proc.returncode}", self.token)
 
-            retriable = last_status in (429, 500, 502, 503, 504) or (
-                last_status == 403 and "rate limit" in last_error.lower()
+            retriable = (
+                last_status == 429
+                or (last_status is not None and 500 <= last_status <= 599)
+                or (last_status == 403 and "rate limit" in last_error.lower())
             )
             if retriable and attempt < self.max_retries:
                 wait = min(2 ** attempt, 8)
@@ -338,7 +340,9 @@ class GhCliClient:
         result = self.api(f"repos/{repo}/actions/runs/{int(run_id)}", method="DELETE")
         if result.ok:
             return result
-        # A 404 on DELETE means the run is already gone: the desired end state.
+        # A 404 on DELETE is a raw idempotent response, not proof of absence.
+        # The retention executor keeps it separate until a complete re-list
+        # confirms the run id is gone.
         if result.not_found:
             return ApiResult(True, 404, None, None)
         return result

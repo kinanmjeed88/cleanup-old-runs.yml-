@@ -26,7 +26,7 @@ Python files.
 
 ```
 .github/workflows/cleanup-old-runs.yml   central entry point (schedule = dry-run, dispatch = dry-run|live)
-.github/workflows/ci.yml                 test + syntax + workflow-permission gates
+.github/workflows/ci.yml                 test + syntax + Ruff import lint + workflow-permission gates
 config/accounts.txt                      accounts to discover (one login per line)
 config/repositories.txt                  optional list, used only by discovery mode `list`/`union`
 tool/branch_cleanup.py                   branch deletion algorithm — UNCHANGED decision logic
@@ -130,6 +130,16 @@ The central-repository exclusion applies only to the branch phase. Run
 retention is executed before that exclusion is considered, so the central
 repository's runs are still listed, planned and reported. `branches_examined=0`
 therefore does not imply that run retention was skipped.
+
+Branch deletion uses the same raw-vs-verified distinction: a branch DELETE 404
+is recorded as `branches_delete_404` and only becomes `branches_already_absent`
+after an exact-ref `git ls-remote --heads origin refs/heads/<branch>` re-list
+confirms absence. If the re-list is incomplete or still shows the branch, the
+attempt is a failure, not an idempotent success. Dry-run branch reports keep
+`branches_deleted`, `branches_already_absent` and `branches_delete_404` at **0**
+and expose the plan through `branches_planned_deletions`. The report also
+carries `branch_open_pr.complete`; an incomplete open-PR listing refuses branch
+deletions.
 
 ### Branch cleanup reuse
 

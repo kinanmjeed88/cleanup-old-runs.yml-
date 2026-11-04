@@ -123,6 +123,10 @@ process exit `1`; a dry run never mutates anything.
 | `runs_failed` | Failed DELETE attempts, including HTTP 422. Continuing after a 422 does not clear the failure. |
 | `runs_remaining` | In dry-run, the observed listing count (nothing was deleted). After live deletion attempts, the complete post-execution re-list count, or `unknown`/`null` if discovery/verification is incomplete or a live execution aborted before a trustworthy re-list. |
 | `branches_examined = 0` | The branch phase did not inspect branches (for example `skip_branches=true` or the central-repository branch exclusion). It says nothing about run retention. |
+| `branches_deleted` | Successful branch DELETE responses only. A dry run is always **0**. |
+| `branches_already_absent` | Branch DELETE 404 responses **only after** an exact-ref `git ls-remote` re-list confirms the head is gone. Raw branch 404s are reported separately as `branches_delete_404`. |
+| `branches_planned_deletions` | Branches selected for deletion. In dry-run this is the plan size while `branches_deleted` remains **0**. |
+| `branch_open_pr.complete` | Whether the open-PR listing used for branch protection was complete. An incomplete listing refuses branch deletions. |
 
 The central repository is excluded from **branch cleanup only**. Its workflow
 runs are still listed, planned and reported like any other repository. The

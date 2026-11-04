@@ -50,17 +50,41 @@ DEFAULT_COMMAND_TIMEOUT = 60
 GIT_LIST_TIMEOUT = 120
 GIT_FETCH_TIMEOUT = 900
 MAX_BRANCH_PAGES = 50
+MAX_RETRY_WAIT_SECONDS = 60
+_TOKEN_ENV_VARS = (
+    "CLEANUP_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
 _HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})", re.IGNORECASE)
 _RETRY_AFTER_RE = re.compile(r"retry-after[:\s]+(\d+)", re.IGNORECASE)
 _SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 def _secret_token() -> str:
+    """Primary token kept for backward-compatible callers; never logged."""
     return os.environ.get("CLEANUP_TOKEN") or os.environ.get("GH_TOKEN") or ""
 
 
 def _redact(text: str) -> str:
-    return redact(text or "", _secret_token())
+    """Redact every credential-bearing environment variable, not just one.
+
+    A child process may surface an inherited ``GITHUB_TOKEN`` even when
+    ``CLEANUP_TOKEN`` is the active identity.  Redacting only the active token
+    would leak the inherited one.
+    """
+    safe = text or ""
+    tokens = dict.fromkeys(os.environ.get(name) or "" for name in _TOKEN_ENV_VARS)
+    for token in tokens:
+        if token:
+            safe = redact(safe, token)
+    return redact(safe)
+
+
+def _is_server_error(status: Optional[int]) -> bool:
+    return status is not None and 500 <= status <= 599
 
 
 def _http_status(stderr: str) -> Optional[int]:
@@ -133,6 +157,9 @@ class BranchListing:
             "pages_read": self.pages_read,
             "http_status": self.http_status,
             "returncode": self.returncode,
+            # Diagnostic alias requested by operational reports; the legacy
+            # ``returncode`` field is kept for backward compatibility.
+            "exit_code": self.returncode,
             "stderr": _redact(self.stderr)[:2000],
             "error": _redact(self.error),
             "warnings": [_redact(w) for w in self.warnings],
@@ -301,10 +328,17 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(cmd, 124, "", f"command timed out after {timeout}s")
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+    except PermissionError as exc:
+        return subprocess.CompletedProcess(cmd, 126, "", str(exc))
 
 
 def gh_api(endpoint: str, method: str = "GET", **kwargs) -> Optional[dict]:
-    """Call gh api with rate-limit aware retry."""
+    """Call gh api with bounded, status-aware retry.
+
+    Rate limits and 5xx/transport transients are retried; ordinary 401/403,
+    404 and 422 are not.  ``Retry-After`` is honoured when present and every
+    wait is capped so a hostile/misparsed header cannot hang the workflow.
+    """
     max_retries = 3
     for attempt in range(max_retries):
         proc = run(["gh", "api", endpoint, "--method", method] + kwargs.get("extra_args", []))
@@ -314,46 +348,60 @@ def gh_api(endpoint: str, method: str = "GET", **kwargs) -> Optional[dict]:
             except json.JSONDecodeError:
                 # For non-JSON responses (e.g., DELETE)
                 return {}
-        stderr = proc.stderr.lower()
-        # Retry rate limits and transient server errors, never ordinary permission
-        # denials: a plain 403 is not made safer by repeating it.
-        if any(code in stderr for code in ["429", "rate limit", "secondary rate"]) or (
-            "403" in stderr and "rate" in stderr
-        ):
-            retry_after = _RETRY_AFTER_RE.search(proc.stderr or "")
+        stderr = proc.stderr or ""
+        lowered = stderr.lower()
+        status = _http_status(stderr)
+        rate_limited = status == 429 or "rate limit" in lowered or "secondary rate" in lowered or (
+            status == 403 and "rate" in lowered
+        )
+        if rate_limited:
+            retry_after = _RETRY_AFTER_RE.search(stderr)
             default_wait = int(retry_after.group(1)) if retry_after else 2 ** attempt
-            wait = int(kwargs.get("retry_after", default_wait))
+            wait = min(int(kwargs.get("retry_after", default_wait)), MAX_RETRY_WAIT_SECONDS)
             print(f"::warning::GitHub API rate limited on {endpoint}, retry {attempt+1}/{max_retries} after {wait}s", file=sys.stderr)
             time.sleep(wait)
             continue
-        if "404" in stderr or "not found" in stderr:
+        if status == 404:
             return None
-        if attempt < max_retries - 1 and any(x in stderr for x in ["500", "502", "503", "504", "connection", "timed out"]):
-            time.sleep(2 ** attempt)
+        transient = _is_server_error(status) or (
+            status is None and any(word in lowered for word in ("connection", "timed out", "timeout"))
+        )
+        if attempt < max_retries - 1 and transient:
+            retry_after = _RETRY_AFTER_RE.search(stderr)
+            wait = min(int(retry_after.group(1)) if retry_after else 2 ** attempt, MAX_RETRY_WAIT_SECONDS)
+            time.sleep(wait)
             continue
-        print(f"::warning::gh api {endpoint} failed: {_redact(proc.stderr.strip())}", file=sys.stderr)
+        print(f"::warning::gh api {endpoint} failed: {_redact(stderr.strip())}", file=sys.stderr)
         return None
     return None
+
+
+def _valid_default_branch(value: str) -> bool:
+    return bool(value) and value not in {"(unknown)", "unknown", "(not a symbolic ref)"}
 
 
 def fetch_default_branch(repo: str) -> Optional[str]:
     proc = run(["gh", "api", f"repos/{repo}", "--jq", ".default_branch"])
     if proc.returncode == 0:
         branch = proc.stdout.strip()
-        if branch:
+        if _valid_default_branch(branch):
             print(f"Default branch from API: {branch}")
             return branch
-    # Fallback: git remote
+    # Fallback: git remote.  Empty repositories may report "(unknown)".
     proc = run(["git", "remote", "show", "origin"])
     if proc.returncode == 0:
         for line in proc.stdout.splitlines():
             if "HEAD branch:" in line:
-                return line.split(":")[-1].strip()
-    # Fallback: origin/HEAD symbolic ref
+                branch = line.split(":", 1)[-1].strip()
+                if _valid_default_branch(branch):
+                    return branch
+    # Fallback: origin/HEAD symbolic ref.  Preserve slashes in branch names.
     proc = run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"])
     if proc.returncode == 0:
         ref = proc.stdout.strip()
-        return ref.split("/")[-1]
+        branch = ref.removeprefix("refs/remotes/origin/")
+        if _valid_default_branch(branch):
+            return branch
     return None
 
 
@@ -383,6 +431,9 @@ def _list_remote_branches_api_detailed(repo: str) -> BranchListing:
                 name = obj["name"]
                 if not isinstance(name, str) or not name:
                     raise ValueError("branch name missing")
+                sha = obj.get("sha")
+                if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
+                    raise ValueError("branch commit sha missing or invalid")
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 result.error = f"invalid branch record on page {page}: {exc}"
                 print(f"::warning::{_redact(result.error)}", file=sys.stderr)
@@ -392,7 +443,7 @@ def _list_remote_branches_api_detailed(repo: str) -> BranchListing:
                 print(f"::warning::{_redact(result.error)}", file=sys.stderr)
                 return result
             seen.add(name)
-            result.branches.append(BranchInfo(name=name, sha=obj.get("sha"), protected=bool(obj.get("protected", False))))
+            result.branches.append(BranchInfo(name=name, sha=sha, protected=bool(obj.get("protected", False))))
         if len(lines) < 100:
             result.complete = True
             return result
@@ -487,46 +538,83 @@ def list_remote_branches_git_fallback() -> list[BranchInfo]:
 
 
 def list_open_pr_branches(repo: str) -> tuple[set[str], bool]:
-    """Return (open-pr refs, complete).  Missing an open PR could delete work."""
+    """Return (open-pr refs, complete).  Missing an open PR could delete work.
+
+    Pagination is counted on PR records, not on the de-duplicated branch set:
+    several open PRs can legitimately share one head branch.  Invalid records
+    or a repeated PR number across pages mean the snapshot is not trustworthy.
+    """
     refs: set[str] = set()
+    seen_numbers: set[int] = set()
     page = 1
     while True:
-        proc = run(["gh", "api", f"repos/{repo}/pulls?state=open&per_page=100&page={page}", "--jq", ".[].head.ref"])
+        proc = run([
+            "gh", "api", f"repos/{repo}/pulls?state=open&per_page=100&page={page}",
+            "--jq", ".[] | {number: .number, head_ref: .head.ref}",
+        ])
         if proc.returncode != 0:
+            print(f"::warning::open PR listing failed on page {page}: {_redact(proc.stderr)[:500]}", file=sys.stderr)
             return refs, False
-        lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
         if not lines:
             return refs, True
-        refs.update(lines)
+        for line in lines:
+            try:
+                obj = json.loads(line)
+                number = obj["number"]
+                head_ref = obj["head_ref"]
+                if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                    raise ValueError("invalid PR number")
+                if not isinstance(head_ref, str) or not head_ref:
+                    raise ValueError("open PR head_ref missing")
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                print(f"::warning::invalid open PR record on page {page}: {exc}", file=sys.stderr)
+                return refs, False
+            if number in seen_numbers:
+                print(f"::warning::duplicate open PR number {number} during pagination", file=sys.stderr)
+                return refs, False
+            seen_numbers.add(number)
+            refs.add(head_ref)
         if len(lines) < 100:
             return refs, True
         page += 1
-        if page > 50:
+        if page > MAX_BRANCH_PAGES:
+            print(f"::warning::open PR pagination exceeded safety cap of {MAX_BRANCH_PAGES} pages", file=sys.stderr)
             return refs, False
 
 
 def list_closed_merged_prs(repo: str) -> dict[str, PRInfo]:
-    """Map head_ref -> PRInfo for closed merged PRs (recent 500)."""
+    """Map head_ref -> PRInfo for closed merged PRs (recent 500).
+
+    The API page is counted *before* filtering merged PRs.  Filtering in jq
+    first would make a full page of mostly-unmerged PRs look like a short page
+    and silently stop pagination, losing merge evidence for older branches.
+    Missing evidence is conservative (the branch is kept), but the plan should
+    still be as complete as the bounded recent-PR window allows.
+    """
     prs: dict[str, PRInfo] = {}
     page = 1
     while True:
         proc = run([
             "gh", "api",
             f"repos/{repo}/pulls?state=closed&per_page=100&page={page}&sort=updated&direction=desc",
-            "--jq", '.[] | select(.merged_at != null) | {number: .number, head_ref: .head.ref, state: .state, merged: true, merged_at: .merged_at, merge_commit_sha: .merge_commit_sha, base_ref: .base.ref}'
+            "--jq", ".[] | {number: .number, head_ref: .head.ref, state: .state, merged_at: .merged_at, merge_commit_sha: .merge_commit_sha, base_ref: .base.ref}",
         ])
         if proc.returncode != 0:
+            print(f"::warning::closed PR listing failed on page {page}: {_redact(proc.stderr)[:500]}", file=sys.stderr)
             break
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
         if not lines:
             break
         for line in lines:
             try:
                 obj = json.loads(line)
-                ref = obj.get("head_ref")
-                if not ref:
+                if not obj.get("merged_at"):
                     continue
-                # Keep latest merged PR per branch
+                ref = obj.get("head_ref")
+                if not isinstance(ref, str) or not ref:
+                    continue
+                # Keep latest merged PR per branch (API is sorted updated desc).
                 if ref not in prs:
                     prs[ref] = PRInfo(
                         number=obj["number"],
@@ -537,9 +625,12 @@ def list_closed_merged_prs(repo: str) -> dict[str, PRInfo]:
                         merge_commit_sha=obj.get("merge_commit_sha"),
                         base_ref=obj.get("base_ref"),
                     )
-            except Exception:
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
-        if len(lines) < 100 or page >= 5:  # limit to 500 recent merged PRs
+        if len(lines) < 100:
+            break
+        if page >= 5:  # bounded recent-PR window: 500 closed PRs
+            print("::warning::closed merged PR evidence limited to the most recent 500 closed PRs", file=sys.stderr)
             break
         page += 1
     return prs
@@ -549,11 +640,22 @@ def check_protected_branches(branches: list[BranchInfo]) -> set[str]:
     return {b.name for b in branches if b.protected}
 
 
-def ensure_full_history():
-    # Ensure we have full history for ancestor checks
-    run(["git", "fetch", "origin", "--prune", "--tags", "--prune-tags"], check=False, timeout=GIT_FETCH_TIMEOUT)
-    # Fetch all heads to remotes/origin/*
-    run(["git", "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], check=False, timeout=GIT_FETCH_TIMEOUT)
+def ensure_full_history() -> bool:
+    """Fetch full history and every head before merge proofs are evaluated.
+
+    A failed fetch must not leave stale refs available for a deletion plan.
+    The caller fails closed when this returns False.
+    """
+    ok = True
+    proc = run(["git", "fetch", "origin", "--prune", "--tags", "--prune-tags"], check=False, timeout=GIT_FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        print(f"::warning::git history fetch failed (exit {proc.returncode}): {_redact(proc.stderr)[:500]}", file=sys.stderr)
+        ok = False
+    proc = run(["git", "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"], check=False, timeout=GIT_FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        print(f"::warning::git heads fetch failed (exit {proc.returncode}): {_redact(proc.stderr)[:500]}", file=sys.stderr)
+        ok = False
+    return ok
 
 
 def is_ancestor(branch: str, default_branch: str) -> Optional[bool]:
@@ -601,8 +703,9 @@ def protection_status(repo: str, branch: str) -> str:
     proc = run(["gh", "api", f"repos/{repo}/branches/{encoded}/protection"])
     if proc.returncode == 0:
         return "protected"
-    stderr = (proc.stderr or "").lower()
-    if "404" in stderr or "not found" in stderr:
+    # Only an explicit HTTP 404 is conclusive.  A substring match on "not
+    # found" could misread a 403/5xx body and delete a protected branch.
+    if _http_status(proc.stderr or "") == 404:
         return "unprotected"
     return "unknown"
 
@@ -621,24 +724,74 @@ def refresh_remote_refs(branch: str, default_branch: str) -> bool:
     return proc.returncode == 0
 
 
-def delete_branch_remote(repo: str, branch: str, dry_run: bool = True) -> bool:
+@dataclass(frozen=True)
+class BranchDeleteResult:
+    """Structured branch DELETE outcome.
+
+    ``already_absent`` is only used after an independent exact-ref re-list
+    confirms the branch is gone.  A raw 404 without that proof is a failure.
+    """
+
+    outcome: str  # planned | deleted | already_absent | failed
+    http_status: Optional[int] = None
+    error: str = ""
+    verified_absent: bool = False
+
+
+def verify_branch_absent(repo: str, branch: str) -> Optional[bool]:
+    """Re-list the exact remote head: True=absent, False=present, None=unknown."""
+    proc = run(
+        ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+        timeout=GIT_LIST_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        print(f"::warning::branch absence re-list failed for {branch}: {_redact(proc.stderr)[:500]}", file=sys.stderr)
+        return None
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return True
+    expected_ref = f"refs/heads/{branch}"
+    for line in lines:
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1] == expected_ref and _SHA_RE.fullmatch(parts[0]):
+            return False
+    print(f"::warning::unexpected branch absence re-list output for {branch}", file=sys.stderr)
+    return None
+
+
+def delete_branch_remote_detailed(repo: str, branch: str, dry_run: bool = True) -> BranchDeleteResult:
     if dry_run:
         print(f"[DRY RUN] Would delete branch: {branch}")
-        return True
+        return BranchDeleteResult("planned")
     print(f"Deleting branch {branch} through the scoped API...")
     encoded = quote(branch, safe="/")
     proc = run(["gh", "api", "--method", "DELETE", f"repos/{repo}/git/refs/heads/{encoded}"])
     if proc.returncode == 0:
         print(f"Deleted branch {branch}")
-        return True
-    stderr = (proc.stderr or "").lower()
-    if "404" in stderr or "not found" in stderr:
-        print(f"Branch {branch} was already absent (HTTP 404); desired end state reached")
-        return True
+        return BranchDeleteResult("deleted", http_status=204)
+    status = _http_status(proc.stderr or "")
+    if status == 404:
+        absent = verify_branch_absent(repo, branch)
+        if absent is True:
+            print(f"Branch {branch} was already absent (HTTP 404 verified by exact-ref re-list)")
+            return BranchDeleteResult("already_absent", http_status=404, verified_absent=True)
+        reason = "branch still present after DELETE 404" if absent is False else "absence could not be verified after DELETE 404"
+        print(f"::warning::Branch {branch}: {reason}", file=sys.stderr)
+        return BranchDeleteResult("failed", http_status=404, error=reason)
     # Never fall back to a Git push for deletion. A failed API request is
     # inconclusive; keep the branch and require a fresh, explicit review.
-    print(f"::warning::Failed to delete {branch} through the scoped API: {_redact(proc.stderr)}", file=sys.stderr)
-    return False
+    error = _redact(proc.stderr or "")
+    print(f"::warning::Failed to delete {branch} through the scoped API: {error}", file=sys.stderr)
+    return BranchDeleteResult("failed", http_status=status, error=error)
+
+
+def delete_branch_remote(repo: str, branch: str, dry_run: bool = True) -> bool:
+    """Backward-compatible boolean wrapper; main() uses the detailed result."""
+    return delete_branch_remote_detailed(repo, branch, dry_run=dry_run).outcome in {
+        "planned",
+        "deleted",
+        "already_absent",
+    }
 
 
 def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tuple[int, int, int]:
@@ -655,52 +808,67 @@ def cleanup_runs(repo: str, cutoff_hours: int = 24, dry_run: bool = True) -> tup
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
     current_run_id = os.environ.get("GITHUB_RUN_ID", "")
-    print(f"Deleting workflow runs created before: {cutoff_str} (cutoff {cutoff_hours}h)")
+    print(f"Legacy cutoff preview: runs created before {cutoff_str} (cutoff {cutoff_hours}h)")
     page = 1
-    deleted = 0
     skipped = 0
-    failed = 0
+    candidates: list[dict] = []
+    complete = True
+    # Two-pass: never delete from a partially enumerated listing.
     while True:
         proc = run(["gh", "api", f"repos/{repo}/actions/runs?per_page=100&page={page}", "--jq", "[.workflow_runs[] | {id: .id, created_at: .created_at, status: .status, name: .name}]"])
         if proc.returncode != 0:
             print(f"::warning::Failed to list runs page {page}: {_redact(proc.stderr)}", file=sys.stderr)
+            complete = False
             break
         try:
             runs = json.loads(proc.stdout) if proc.stdout.strip() else []
-        except Exception:
-            runs = []
+            if not isinstance(runs, list):
+                raise ValueError("runs page is not a list")
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"::warning::Invalid runs page {page}: {exc}", file=sys.stderr)
+            complete = False
+            break
         if not runs:
             break
         for r in runs:
+            if not isinstance(r, dict) or r.get("id") is None:
+                print(f"::warning::Invalid run record on page {page}", file=sys.stderr)
+                complete = False
+                continue
             run_id = str(r.get("id"))
             created = r.get("created_at", "")
             status = r.get("status", "")
-            name = r.get("name", "")
-            if run_id == current_run_id:
+            if run_id == current_run_id or status != "completed" or created >= cutoff_str:
                 skipped += 1
                 continue
-            if status != "completed":
-                skipped += 1
-                continue
-            if created >= cutoff_str:
-                skipped += 1
-                continue
-            if dry_run:
-                print(f"[DRY RUN] would delete run {run_id} | {created} | {name}")
-                continue
-            print(f"Deleting run {run_id} | {created} | {name}")
-            del_proc = run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/runs/{run_id}"])
-            if del_proc.returncode == 0:
-                deleted += 1
-            else:
-                print(f"::warning::Failed to delete run {run_id}: {_redact(del_proc.stderr)}", file=sys.stderr)
-                failed += 1
+            candidates.append(r)
         if len(runs) < 100:
             break
         page += 1
         if page > 100:
-            print("::warning::Too many pages for runs, stopping", file=sys.stderr)
+            print("::warning::Too many pages for runs; refusing legacy cleanup", file=sys.stderr)
+            complete = False
             break
+    if not complete:
+        print("::error::Legacy run listing incomplete; no runs were deleted", file=sys.stderr)
+        return 0, skipped, 1
+
+    deleted = 0
+    failed = 0
+    for r in candidates:
+        run_id = str(r.get("id"))
+        created = r.get("created_at", "")
+        name = r.get("name", "")
+        if dry_run:
+            print(f"[DRY RUN] would delete run {run_id} | {created} | {name}")
+            continue
+        print(f"Deleting run {run_id} | {created} | {name}")
+        del_proc = run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/runs/{run_id}"])
+        if del_proc.returncode == 0:
+            deleted += 1
+        else:
+            print(f"::warning::Failed to delete run {run_id}: {_redact(del_proc.stderr)}", file=sys.stderr)
+            failed += 1
     print(f"Runs cleanup: deleted={deleted} skipped={skipped} failed={failed} dry_run={dry_run}")
     return deleted, skipped, failed
 
@@ -752,10 +920,13 @@ def main():
         "deleted": 0,
         "planned_deletions": 0,
         "failed": 0,
+        "already_absent": 0,
+        "delete_404": 0,
         "results": [],
         "errors": [],
         "branches_complete": False,
         "open_pr_complete": False,
+        "open_pr_branch_count": 0,
         "empty_verified": False,
         "branch_listing": {},
     }
@@ -770,9 +941,13 @@ def main():
     if dry_run:
         print("Running in DRY RUN mode — no branches or runs will be deleted. Set --delete or DELETE_BRANCHES=true to enable.")
 
-    # Ensure full git history for ancestor checks
-    if not args.skip_branches:
-        ensure_full_history()
+    # Ensure full git history for ancestor checks.  Stale refs are not a safe
+    # basis for a deletion plan, so a fetch failure fails closed.
+    if not args.skip_branches and not ensure_full_history():
+        report["errors"].append("could not fetch full git history; refusing branch cleanup")
+        _write_json_report(args.json_report, report)
+        print("::error::Could not fetch full git history; refusing branch cleanup", file=sys.stderr)
+        sys.exit(1)
 
     default_branch = fetch_default_branch(repo)
     if not default_branch:
@@ -796,6 +971,7 @@ def main():
         protected_set = check_protected_branches(branches_api)
         open_pr_set, open_pr_complete = list_open_pr_branches(repo)
         report["open_pr_complete"] = open_pr_complete
+        report["open_pr_branch_count"] = len(open_pr_set)
         merged_prs = list_closed_merged_prs(repo) if branches_api else {}
 
         if not branches_complete or (branches_api and not open_pr_complete):
@@ -824,6 +1000,8 @@ def main():
         deleted = 0
         kept = 0
         failed = 0
+        already_absent = 0
+        raw_delete_404 = 0
 
         for branch in branches_api:
             # Skip default immediately
@@ -841,9 +1019,7 @@ def main():
             if pr_info and pr_info.merge_commit_sha:
                 merge_anc = merge_commit_is_ancestor(pr_info.merge_commit_sha, default_branch)
 
-            # Determine protected via API flag already in branch.protected
-            protected_flag = branch.protected
-
+            # Protection is carried by branch.protected and re-verified below.
             res = evaluate_branch(
                 branch,
                 default_branch=default_branch,
@@ -899,10 +1075,14 @@ def main():
                     results.append(res)
                     continue
 
-                success = delete_branch_remote(repo, branch.name, dry_run=dry_run)
-                if success:
+                delete_result = delete_branch_remote_detailed(repo, branch.name, dry_run=dry_run)
+                if delete_result.http_status == 404:
+                    raw_delete_404 += 1
+                if delete_result.outcome == "deleted":
                     deleted += 1
-                else:
+                elif delete_result.outcome == "already_absent":
+                    already_absent += 1
+                elif delete_result.outcome == "failed":
                     failed += 1
                 results.append(res)
                 print(f"{res.action.upper()} {branch.name}: {res.reason} — {res.details}")
@@ -911,9 +1091,12 @@ def main():
                 print(f"KEEP {branch.name}: {res.reason} — {res.details}")
                 results.append(res)
 
+        planned_count = sum(1 for r in results if r.action == "delete")
         print("\n=== Branch cleanup summary ===")
         print(f"Total branches examined: {len(branches_api)}")
-        print(f"Deleted: {deleted} (dry_run={dry_run})")
+        print(f"Planned deletions: {planned_count} (dry_run={dry_run})")
+        print(f"Deleted: {0 if dry_run else deleted}")
+        print(f"Already absent (verified): {0 if dry_run else already_absent}")
         print(f"Kept: {kept}")
         print(f"Failed deletions: {failed}")
         for r in results:
@@ -926,17 +1109,24 @@ def main():
                 with open(summary_path, "a", encoding="utf-8") as f:
                     f.write(f"### Branch cleanup ({'DRY RUN' if dry_run else 'LIVE'})\n")
                     f.write(f"- Default branch: `{default_branch}`\n")
-                    f.write(f"- Total: {len(branches_api)}, Deleted: {deleted}, Kept: {kept}, Failed: {failed}\n")
+                    f.write(
+                        f"- Total: {len(branches_api)}, Planned: {planned_count}, "
+                        f"Deleted: {0 if dry_run else deleted}, "
+                        f"Already absent: {0 if dry_run else already_absent}, "
+                        f"Kept: {kept}, Failed: {failed}\n"
+                    )
                     f.write("| Branch | Action | Reason |\n|---|---|---|\n")
                     for r in results:
                         f.write(f"| {r.branch} | {r.action} | {r.reason} |\n")
-            except Exception:
+            except OSError:
                 pass
 
         report["branches_examined"] = len(branches_api)
         report["kept"] = kept
-        report["planned_deletions"] = sum(1 for r in results if r.action == "delete")
+        report["planned_deletions"] = planned_count
         report["deleted"] = 0 if dry_run else deleted
+        report["already_absent"] = 0 if dry_run else already_absent
+        report["delete_404"] = 0 if dry_run else raw_delete_404
         report["failed"] = failed
         report["results"] = [
             {"branch": r.branch, "action": r.action, "reason": r.reason} for r in results
@@ -948,6 +1138,8 @@ def main():
     if not args.skip_runs:
         deleted, skipped, failed = cleanup_runs(repo, cutoff_hours=args.cutoff_hours, dry_run=dry_run)
         print(f"Runs summary: deleted={deleted} skipped={skipped} failed={failed}")
+        if failed:
+            report["errors"].append(f"{failed} legacy run cleanup failure(s)")
 
     _write_json_report(args.json_report, report)
     print("Cleanup finished.")

@@ -229,3 +229,24 @@ def test_delete_422_is_a_visible_non_retried_failure(token: str):
     assert result.transport_error is False
     assert "422" in result.error
     assert calls["n"] == 1
+
+
+def test_any_5xx_is_retried_as_transient(token: str):
+    import subprocess
+
+    calls = {"n": 0}
+    sleeps = []
+
+    def runner(cmd, env, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return subprocess.CompletedProcess(cmd, 1, "", "gh: Not Implemented (HTTP 501)")
+        return subprocess.CompletedProcess(cmd, 0, '{"ok": true}', "")
+
+    from tool.github_client import GhCliClient
+
+    client = GhCliClient(token=token, runner=runner, sleep=sleeps.append, log=lambda _m: None)
+    result = client.api("repos/o/r")
+    assert result.ok is True
+    assert calls["n"] == 2
+    assert sleeps == [1]

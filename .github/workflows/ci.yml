@@ -40,6 +40,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
+          python -m pip check
 
       - name: Python syntax check
         shell: bash
@@ -47,6 +48,10 @@ jobs:
           set -euo pipefail
           python -m compileall -q tool tests
           echo "All Python files compile."
+
+      - name: Import and static lint (Ruff)
+        shell: bash
+        run: python -m ruff check tool tests --select E9,F63,F7,F82,F401,F811,F821,F841
 
       - name: Workflow syntax and least-privilege check
         shell: bash

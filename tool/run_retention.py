@@ -50,8 +50,13 @@ REASON_UNVERIFIABLE_CREATED_AT = "unverifiable created_at"
 REASON_OLDER_THAN_RETENTION = "older than the newest {keep} completed runs"
 
 # HTTP failures that stop the remaining deletions for one repository.  404 is
-# deliberately absent: it is an idempotent "already gone" result, not a failure.
+# deliberately absent: it is a raw "already gone" response that still requires
+# post-execution verification.  Any 5xx is a stop, not just the common ones.
 STOP_DELETE_STATUSES = frozenset({401, 403, 429, 500, 502, 503, 504})
+
+
+def _stops_repository(status: Optional[int]) -> bool:
+    return status is None or status in STOP_DELETE_STATUSES or 500 <= status <= 599
 
 
 @dataclass(frozen=True)
@@ -417,9 +422,9 @@ def apply_retention(
     """Execute (or simulate) the deletions of a plan.
 
     * 204/200 success increments ``deleted``.
-    * A run-specific DELETE 404 increments ``already_absent`` (idempotent
-      resume, not a deletion).  The later re-list must confirm absence; a 404
-      is not treated as proof that this process deleted the run.
+    * A run-specific DELETE 404 is recorded as a raw 404 (not a deletion).
+      The later complete re-list must confirm absence before the report counts
+      it as ``already_absent``; a 404 alone is not proof.
     * 401/403/429/5xx/transport uncertainty stops the repository.
     * 422 and other per-run client errors are recorded as failures and the loop
       continues.  Continuing never converts a failed DELETE into a success.
@@ -449,7 +454,7 @@ def apply_retention(
             continue
 
         outcome.failed.append((run.id, f"delete failed (status {result.status}): {result.error}"))
-        if result.status in STOP_DELETE_STATUSES or result.status is None:
+        if _stops_repository(result.status):
             label = f"HTTP {result.status}" if result.status is not None else "transport failure"
             outcome.stop_reason = (
                 f"GitHub deletion stopped for run {run.id} ({label}). "

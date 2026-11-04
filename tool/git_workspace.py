@@ -159,12 +159,17 @@ class GitWorkspaceFactory:
             # Persist *only* the env-reading helper for the child process, and
             # reset any inherited helpers first so a global credential store can
             # never be used with a different identity.
-            self._git(["-C", str(path), "config", "--local", "--add", "credential.helper", ""], timeout=60)
-            self._git(
-                ["-C", str(path), "config", "--local", "--add", "credential.helper", CREDENTIAL_HELPER],
-                timeout=60,
-            )
-            self._git(["-C", str(path), "config", "--local", "gc.auto", "0"], timeout=60)
+            for config_args in (
+                ["config", "--local", "--add", "credential.helper", ""],
+                ["config", "--local", "--add", "credential.helper", CREDENTIAL_HELPER],
+                ["config", "--local", "gc.auto", "0"],
+            ):
+                configured = self._git(["-C", str(path), *config_args], timeout=60)
+                if configured.returncode != 0:
+                    raise WorkspaceError(
+                        "could not configure the isolated git workspace safely: "
+                        f"{redact(configured.stderr.strip(), self._token)}"
+                    )
 
             # Full history and every branch, so ancestor/diff proofs are exact.
             fetch = self._git(
